@@ -29,15 +29,30 @@ index 8dd28c9..6234323 100644
 -target_include_directories(${PROJECT_NAME} PUBLIC . Swapchain)
 +target_include_directories(${PROJECT_NAME} PUBLIC . Swapchain PRIVATE ${FFMPEG_INCLUDE_DIRS})
  set_property(TARGET ${PROJECT_NAME} PROPERTY POSITION_INDEPENDENT_CODE ON)
+diff --git a/src/Image.hpp b/src/Image.hpp
+index ccefef4..677d980 100644
+--- a/src/Image.hpp
++++ b/src/Image.hpp
+@@ -65,6 +65,9 @@ struct Image : NoCopy, NoMove {
+     ImageHeader       header;
+     std::vector<Slot> slots;
+     std::string       key;
++    // If this .tex payload was actually an MP4/H.264 video, the raw stream is
++    // kept here (shared) so the texture cache can drive a VideoPlayer for it.
++    std::shared_ptr<std::vector<uint8_t>> videoData;
+ };
+ 
+ } // namespace wallpaper
 diff --git a/src/VideoTex.cpp b/src/VideoTex.cpp
 new file mode 100644
-index 0000000..c0208c9
+index 0000000..97e752b
 --- /dev/null
 +++ b/src/VideoTex.cpp
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,181 @@
 +#include "VideoTex.hpp"
 +#include "Utils/Logging.h"
 +#include <cstring>
++#include <chrono>
 +
 +extern "C" {
 +#include <libavformat/avformat.h>
@@ -49,10 +64,8 @@ index 0000000..c0208c9
 +namespace wallpaper {
 +
 +bool LooksLikeVideo(const uint8_t* data, size_t size) {
-+    // ISO Base Media (MP4/MOV): a 'ftyp' box near the start.
 +    if (size < 12) return false;
-+    if (data[4] == 'f' && data[5] == 't' && data[6] == 'y' && data[7] == 'p') return true;
-+    return false;
++    return data[4] == 'f' && data[5] == 't' && data[6] == 'y' && data[7] == 'p';
 +}
 +
 +namespace
@@ -80,93 +93,329 @@ index 0000000..c0208c9
 +    m->pos = static_cast<size_t>(np);
 +    return np;
 +}
++
++// A minimal open/decoder bundle over an in-memory MP4.
++struct Decoder {
++    MemBuf           mb;
++    AVIOContext*     avio { nullptr };
++    AVFormatContext* fmt { nullptr };
++    AVCodecContext*  ctx { nullptr };
++    SwsContext*      sws { nullptr };
++    int              vstream { -1 };
++    int              w { 0 }, h { 0 };
++
++    bool open(const uint8_t* data, size_t size) {
++        mb = { data, size, 0 };
++        const int BSZ = 1 << 16;
++        uint8_t* avio_buf = static_cast<uint8_t*>(av_malloc(static_cast<size_t>(BSZ)));
++        avio = avio_alloc_context(avio_buf, BSZ, 0, &mb, read_cb, nullptr, seek_cb);
++        fmt = avformat_alloc_context();
++        fmt->pb = avio;
++        if (avformat_open_input(&fmt, nullptr, nullptr, nullptr) < 0) return false;
++        if (avformat_find_stream_info(fmt, nullptr) < 0) return false;
++        vstream = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
++        if (vstream < 0) return false;
++        AVCodecParameters* par = fmt->streams[vstream]->codecpar;
++        const AVCodec* dec = avcodec_find_decoder(par->codec_id);
++        if (! dec) return false;
++        ctx = avcodec_alloc_context3(dec);
++        avcodec_parameters_to_context(ctx, par);
++        if (avcodec_open2(ctx, dec, nullptr) < 0) return false;
++        w = ctx->width; h = ctx->height;
++        return true;
++    }
++    // Decode the next frame into `out` (RGBA8). Returns 1 on frame, 0 on EOF, -1 error.
++    int next(std::vector<uint8_t>& out, AVPacket* pkt, AVFrame* frame) {
++        while (true) {
++            int r = av_read_frame(fmt, pkt);
++            if (r < 0) return 0; // EOF / error -> caller loops
++            if (pkt->stream_index != vstream) { av_packet_unref(pkt); continue; }
++            int sr = avcodec_send_packet(ctx, pkt);
++            av_packet_unref(pkt);
++            if (sr < 0) continue;
++            int rr = avcodec_receive_frame(ctx, frame);
++            if (rr == AVERROR(EAGAIN)) continue;
++            if (rr < 0) return -1;
++            int fw = frame->width, fh = frame->height;
++            if (! sws)
++                sws = sws_getContext(fw, fh, static_cast<AVPixelFormat>(frame->format),
++                                     fw, fh, AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr, nullptr, nullptr);
++            out.resize(static_cast<size_t>(fw) * static_cast<size_t>(fh) * 4u);
++            uint8_t* dst[4] = { out.data(), nullptr, nullptr, nullptr };
++            int      dstst[4] = { fw * 4, 0, 0, 0 };
++            sws_scale(sws, frame->data, frame->linesize, 0, fh, dst, dstst);
++            return 1;
++        }
++    }
++    void rewind_() {
++        av_seek_frame(fmt, vstream, 0, AVSEEK_FLAG_BACKWARD);
++        avcodec_flush_buffers(ctx);
++    }
++    void close() {
++        if (sws) sws_freeContext(sws);
++        if (ctx) avcodec_free_context(&ctx);
++        if (fmt) avformat_close_input(&fmt);
++        if (avio) { av_freep(&avio->buffer); avio_context_free(&avio); }
++    }
++};
 +} // namespace
 +
 +bool DecodeVideoFirstFrame(const uint8_t* data, size_t size,
 +                           std::vector<uint8_t>& out_rgba, int& out_w, int& out_h) {
-+    MemBuf mb { data, size, 0 };
-+    const int BSZ = 1 << 16;
-+    uint8_t* avio_buf = static_cast<uint8_t*>(av_malloc(static_cast<size_t>(BSZ)));
-+    AVIOContext* avio = avio_alloc_context(avio_buf, BSZ, 0, &mb, read_cb, nullptr, seek_cb);
-+    AVFormatContext* fmt = avformat_alloc_context();
-+    fmt->pb = avio;
++    Decoder d;
++    if (! d.open(data, size)) { d.close(); LOG_ERROR("video: open failed"); return false; }
++    AVPacket* pkt = av_packet_alloc();
++    AVFrame*  frame = av_frame_alloc();
++    int r = d.next(out_rgba, pkt, frame);
++    out_w = d.w; out_h = d.h;
++    av_frame_free(&frame); av_packet_free(&pkt);
++    d.close();
++    return r == 1;
++}
 +
-+    bool ok = false;
-+    AVCodecContext* ctx = nullptr;
-+    AVPacket* pkt = nullptr;
-+    AVFrame* frame = nullptr;
-+
-+    if (avformat_open_input(&fmt, nullptr, nullptr, nullptr) < 0) { LOG_ERROR("video: open failed"); goto cleanup_avio; }
-+    if (avformat_find_stream_info(fmt, nullptr) < 0) { LOG_ERROR("video: no stream info"); goto cleanup_fmt; }
-+    {
-+        int vs = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
-+        if (vs < 0) { LOG_ERROR("video: no video stream"); goto cleanup_fmt; }
-+        AVCodecParameters* par = fmt->streams[vs]->codecpar;
-+        const AVCodec* dec = avcodec_find_decoder(par->codec_id);
-+        if (! dec) { LOG_ERROR("video: no decoder"); goto cleanup_fmt; }
-+        ctx = avcodec_alloc_context3(dec);
-+        avcodec_parameters_to_context(ctx, par);
-+        if (avcodec_open2(ctx, dec, nullptr) < 0) { LOG_ERROR("video: codec open failed"); goto cleanup_ctx; }
-+        pkt = av_packet_alloc();
-+        frame = av_frame_alloc();
-+        while (av_read_frame(fmt, pkt) >= 0) {
-+            if (pkt->stream_index == vs && avcodec_send_packet(ctx, pkt) == 0 &&
-+                avcodec_receive_frame(ctx, frame) == 0) {
-+                int w = frame->width, h = frame->height;
-+                out_rgba.resize(static_cast<size_t>(w) * static_cast<size_t>(h) * 4u);
-+                SwsContext* sws = sws_getContext(w, h, static_cast<AVPixelFormat>(frame->format),
-+                                                 w, h, AV_PIX_FMT_RGBA, SWS_BILINEAR,
-+                                                 nullptr, nullptr, nullptr);
-+                uint8_t* dst[4] = { out_rgba.data(), nullptr, nullptr, nullptr };
-+                int dstst[4] = { w * 4, 0, 0, 0 };
-+                sws_scale(sws, frame->data, frame->linesize, 0, h, dst, dstst);
-+                sws_freeContext(sws);
-+                out_w = w; out_h = h; ok = true;
-+                break;
-+            }
-+            av_packet_unref(pkt);
-+        }
-+        if (frame) av_frame_free(&frame);
-+        if (pkt) av_packet_free(&pkt);
++VideoPlayer::VideoPlayer(std::shared_ptr<const std::vector<uint8_t>> data) : m_data(std::move(data)) {
++    if (! m_data || m_data->empty()) return;
++    // Probe once so width/height are known immediately (for the initial texture).
++    Decoder probe;
++    if (probe.open(m_data->data(), m_data->size())) {
++        m_w = probe.w; m_h = probe.h; m_ok = true;
 +    }
-+cleanup_ctx:
-+    if (ctx) avcodec_free_context(&ctx);
-+cleanup_fmt:
-+    avformat_close_input(&fmt);
-+    if (avio) { av_freep(&avio->buffer); avio_context_free(&avio); }
-+    return ok;
-+cleanup_avio:
-+    if (fmt) avformat_free_context(fmt);
-+    if (avio) { av_freep(&avio->buffer); avio_context_free(&avio); }
-+    return false;
++    probe.close();
++    if (m_ok) m_thread = std::thread([this] { run(); });
++}
++
++VideoPlayer::~VideoPlayer() {
++    m_stop = true;
++    if (m_thread.joinable()) m_thread.join();
++}
++
++bool VideoPlayer::TakeFrame(std::vector<uint8_t>& out) {
++    std::lock_guard<std::mutex> lk(m_mtx);
++    if (! m_has_new) return false;
++    out = m_latest;
++    m_has_new = false;
++    return true;
++}
++
++void VideoPlayer::run() {
++    Decoder d;
++    if (! d.open(m_data->data(), m_data->size())) { d.close(); return; }
++    // Frame duration from the stream's average frame rate (fallback 30fps).
++    AVRational fr = d.fmt->streams[d.vstream]->avg_frame_rate;
++    double fps = (fr.num > 0 && fr.den > 0) ? (double)fr.num / (double)fr.den : 30.0;
++    if (fps < 1.0 || fps > 240.0) fps = 30.0;
++    auto frame_dur = std::chrono::duration<double>(1.0 / fps);
++
++    AVPacket* pkt = av_packet_alloc();
++    AVFrame*  frame = av_frame_alloc();
++    std::vector<uint8_t> buf;
++    auto next_t = std::chrono::steady_clock::now();
++    while (! m_stop) {
++        int r = d.next(buf, pkt, frame);
++        if (r == 0) { d.rewind_(); continue; }        // loop
++        if (r < 0) break;
++        {
++            std::lock_guard<std::mutex> lk(m_mtx);
++            m_latest.swap(buf);
++            m_has_new = true;
++        }
++        // pace to real time
++        next_t += std::chrono::duration_cast<std::chrono::steady_clock::duration>(frame_dur);
++        auto now = std::chrono::steady_clock::now();
++        if (next_t > now) std::this_thread::sleep_for(next_t - now);
++        else next_t = now;                            // fell behind; don't spiral
++    }
++    av_frame_free(&frame); av_packet_free(&pkt);
++    d.close();
 +}
 +
 +} // namespace wallpaper
 diff --git a/src/VideoTex.hpp b/src/VideoTex.hpp
 new file mode 100644
-index 0000000..3eace62
+index 0000000..227712a
 --- /dev/null
 +++ b/src/VideoTex.hpp
-@@ -0,0 +1,19 @@
+@@ -0,0 +1,57 @@
 +#pragma once
-+// Decode a video (MP4/H.264) that Wallpaper Engine packed inside a scene .tex.
-+// Some scene wallpapers use a playing video as a layer texture; the .tex payload
-+// is then an ISO-BMFF/MP4 stream rather than pixel data.
++// Video textures: some Wallpaper Engine scenes use a playing MP4/H.264 as a
++// layer texture (the .tex payload is an ISO-BMFF/MP4 stream). This provides a
++// still-frame decode (for the initial texture) and a threaded streaming player
++// that keeps producing frames so the layer can animate.
 +#include <cstdint>
 +#include <cstddef>
 +#include <vector>
++#include <memory>
++#include <thread>
++#include <mutex>
++#include <atomic>
 +
 +namespace wallpaper {
 +
-+// Cheap sniff: does this buffer start with an MP4/ISO-BMFF 'ftyp' box?
++// Does this buffer start with an MP4/ISO-BMFF 'ftyp' box?
 +bool LooksLikeVideo(const uint8_t* data, size_t size);
 +
 +// Decode the first frame of an in-memory video to tightly-packed RGBA8.
-+// Returns false if it is not a decodable video.
 +bool DecodeVideoFirstFrame(const uint8_t* data, size_t size,
 +                           std::vector<uint8_t>& out_rgba, int& out_w, int& out_h);
 +
++// Streaming player: owns a copy of the video, decodes frames on a worker thread
++// paced to the video's frame rate, and loops. The render loop polls TakeFrame()
++// once per rendered frame and uploads whatever is newest (dropping frames it is
++// too slow to show). All heavy work is off the render thread.
++class VideoPlayer {
++public:
++    // Shares `data` (no copy of the potentially-large stream).
++    VideoPlayer(std::shared_ptr<const std::vector<uint8_t>> data);
++    ~VideoPlayer();
++    VideoPlayer(const VideoPlayer&)            = delete;
++    VideoPlayer& operator=(const VideoPlayer&) = delete;
++
++    bool ok() const { return m_ok; }
++    int  width() const { return m_w; }
++    int  height() const { return m_h; }
++
++    // If a newer decoded frame is ready, copy it into `out` and return true;
++    // otherwise return false (leave `out` untouched). Non-blocking.
++    bool TakeFrame(std::vector<uint8_t>& out);
++
++private:
++    void run();
++
++    std::shared_ptr<const std::vector<uint8_t>> m_data;
++    std::atomic<bool>    m_ok { false };
++    std::atomic<bool>    m_stop { false };
++    int                  m_w { 0 }, m_h { 0 };
++
++    std::mutex           m_mtx;
++    std::vector<uint8_t> m_latest;      // guarded by m_mtx
++    bool                 m_has_new { false };
++    std::thread          m_thread;
++};
++
 +} // namespace wallpaper
+diff --git a/src/Vulkan/TextureCache.cpp b/src/Vulkan/TextureCache.cpp
+index 4f76e34..56bd6e1 100644
+--- a/src/Vulkan/TextureCache.cpp
++++ b/src/Vulkan/TextureCache.cpp
+@@ -6,6 +6,8 @@
+ #include "Util.hpp"
+ 
+ #include "Image.hpp"
++#include "VideoTex.hpp"
++#include <array>
+ #include "Core/MapSet.hpp"
+ #include "Core/ArrayHelper.hpp"
+ #include "Utils/AutoDeletor.hpp"
+@@ -498,9 +500,48 @@ ImageSlotsRef TextureCache::CreateTex(Image& image) {
+         m_device.handle().WaitIdle();
+     }
+     m_tex_map[image.key] = std::move(img_slots);
++
++    // If this .tex was actually a video, spin up a decoder and remember the
++    // (cache-owned) image so UpdateVideos() can re-upload frames to it. The
++    // static first frame already uploaded above stays as a fallback.
++    if (image.videoData && ! m_tex_map[image.key].slots.empty()) {
++        auto player = std::make_unique<VideoPlayer>(image.videoData);
++        if (player->ok()) {
++            m_video_texs.push_back(VideoTexEntry {
++                std::move(player), ImageParameters(m_tex_map[image.key].slots.at(0)) });
++        }
++    }
+     return m_tex_map[image.key];
+ }
+ 
++void TextureCache::UpdateVideos() {
++    if (m_video_texs.empty()) return;
++    if (! m_tex_cmd) allocateCmd();
++
++    thread_local std::vector<uint8_t> frame;
++    for (auto& vt : m_video_texs) {
++        if (! vt.player->TakeFrame(frame)) continue; // no new frame yet -> keep last
++        const u32 w    = (u32)vt.player->width();
++        const u32 h    = (u32)vt.player->height();
++        const u32 size = w * h * 4u;
++        if (w == 0 || h == 0 || frame.size() < size) continue;
++
++        VmaBufferParameters buf;
++        (void)CreateStagingBuffer(m_device.vma_allocator(), size, buf);
++        {
++            void* v_data;
++            VVK_CHECK(buf.handle.MapMemory(&v_data));
++            memcpy(v_data, frame.data(), size);
++            buf.handle.UnMapMemory();
++        }
++        std::array<BufferParameters, 1> bufs { BufferParameters(buf) };
++        std::array<VkExtent3D, 1>       exts { VkExtent3D { w, h, 1 } };
++        CopyImageData(
++            bufs, exts, m_device.graphics_queue().handle, m_tex_cmd, vt.image);
++        m_device.handle().WaitIdle();
++    }
++}
++
+ void TextureCache::allocateCmd() {
+     const auto& pool = m_device.cmd_pool();
+     VVK_CHECK(pool.Allocate(1, VK_COMMAND_BUFFER_LEVEL_PRIMARY, m_tex_cmds));
+@@ -544,6 +585,7 @@ TextureCache::TextureCache(const Device& device): m_device(device) {}
+ TextureCache::~TextureCache() {};
+ 
+ void TextureCache::Clear() {
++    m_video_texs.clear();
+     m_tex_map.clear();
+     m_query_texs.clear();
+     m_query_map.clear();
+diff --git a/src/Vulkan/include/Vulkan/TextureCache.hpp b/src/Vulkan/include/Vulkan/TextureCache.hpp
+index a4814a2..8e30a39 100644
+--- a/src/Vulkan/include/Vulkan/TextureCache.hpp
++++ b/src/Vulkan/include/Vulkan/TextureCache.hpp
+@@ -9,6 +9,7 @@ namespace wallpaper
+ {
+ 
+ class Image;
++class VideoPlayer;
+ 
+ namespace vulkan
+ {
+@@ -47,6 +48,10 @@ public:
+                                                  VkImageTiling);
+     ImageSlotsRef                    CreateTex(Image&);
+ 
++    // Advance any video-backed textures by one frame (called once per rendered
++    // frame). Cheap when there are none.
++    void                             UpdateVideos();
++
+     std::optional<ImageParameters> Query(std::string_view key, TextureKey content_hash,
+                                          bool persist = false);
+ 
+@@ -63,6 +68,14 @@ private:
+     const Device&                m_device;
+     Map<std::string, ImageSlots> m_tex_map;
+ 
++    // Textures whose source .tex was actually a video: a player produces frames
++    // off-thread and we re-upload to the (owned-by-cache) image each frame.
++    struct VideoTexEntry {
++        std::unique_ptr<VideoPlayer> player;
++        ImageParameters              image;
++    };
++    std::vector<VideoTexEntry> m_video_texs;
++
+     struct QueryTex {
+         idx                index { 0 };
+         bool               share_ready { false };
+diff --git a/src/VulkanRender/VulkanRender.cpp b/src/VulkanRender/VulkanRender.cpp
+index 9fb7776..8ccfcdc 100644
+--- a/src/VulkanRender/VulkanRender.cpp
++++ b/src/VulkanRender/VulkanRender.cpp
+@@ -282,6 +282,10 @@ void VulkanRender::Impl::DestroyRenderingResource(RenderingResources& rr) {}
+ void VulkanRender::Impl::drawFrame(Scene& scene) {
+     if (! (m_inited && m_pass_loaded)) return;
+ 
++    // Advance video-backed textures (in-scene MP4 layers) one frame before we
++    // render. No-op when the scene has none.
++    m_device->tex_cache().UpdateVideos();
++
+         // LOG_INFO("used ram: %fm", (m_device->GetUsage()/1024.0f)/1024.0f);
+ 
+ #if ENABLE_RENDERDOC_API
 diff --git a/src/WPShaderParser.cpp b/src/WPShaderParser.cpp
 index 7c3eaec..ba4a4f4 100644
 --- a/src/WPShaderParser.cpp
@@ -186,7 +435,7 @@ index 7c3eaec..ba4a4f4 100644
           it != std::sregex_iterator();
           it++) {
 diff --git a/src/WPTexImageParser.cpp b/src/WPTexImageParser.cpp
-index ec396e4..1c2f6c9 100644
+index ec396e4..5088150 100644
 --- a/src/WPTexImageParser.cpp
 +++ b/src/WPTexImageParser.cpp
 @@ -1,4 +1,6 @@
@@ -214,7 +463,7 @@ index ec396e4..1c2f6c9 100644
  }
  
  void SetHeaderPow2(ImageHeader& header, i32 mip_0_w, i32 mip_0_h) {
-@@ -184,8 +195,34 @@ std::shared_ptr<Image> WPTexImageParser::Parse(const std::string& name) {
+@@ -184,8 +195,37 @@ std::shared_ptr<Image> WPTexImageParser::Parse(const std::string& name) {
                      return nullptr;
                  }
              }
@@ -222,6 +471,9 @@ index ec396e4..1c2f6c9 100644
 +            // use a playing video as a layer; decode a frame instead of treating
 +            // the stream as raw pixels (which showed as noise).
 +            if (LooksLikeVideo((const uint8_t*)result, (usize)src_size)) {
++                // Keep the raw stream so a VideoPlayer can animate the layer.
++                img.videoData = std::make_shared<std::vector<uint8_t>>(
++                    (const uint8_t*)result, (const uint8_t*)result + (usize)src_size);
 +                std::vector<uint8_t> rgba;
 +                int                  vw = 0, vh = 0;
 +                if (DecodeVideoFirstFrame((const uint8_t*)result, (usize)src_size, rgba, vw, vh)) {

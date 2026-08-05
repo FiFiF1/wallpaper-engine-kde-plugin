@@ -29,10 +29,16 @@ FreeImage-decode path for `TEXB0003+` (not just `==3`). This fixed the
 Some scene wallpapers use a playing **MP4/H.264 video as a layer texture** (the
 `.tex` payload is an `ftyp` MP4). The renderer treated the video bytes as raw
 pixels → noise. Added an ffmpeg-based decoder (`VideoTex.cpp`) and a branch in the
-texture parser that decodes a frame to RGBA. **Currently the first frame only**
-(static) — the content is correct instead of noise; continuous 60fps playback is
-not yet wired (it needs a streaming decoder + updatable texture + render-loop
-hook). Adds a build dependency on **ffmpeg** (libavcodec/format/util/swscale).
+texture parser that decodes to RGBA. **Now plays continuously**: a threaded
+`VideoPlayer` decodes frames off the render thread paced to the stream's frame
+rate and loops; the parser keeps the MP4 in `Image::videoData`; `TextureCache`
+registers a video texture per such layer and re-uploads the newest frame to it
+each rendered frame (`UpdateVideos()`, hooked at the top of
+`VulkanRender::drawFrame`). The first decoded frame is still uploaded at load as a
+fallback. Adds a build dependency on **ffmpeg** (libavcodec/format/util/swscale).
+Cost note: 4K60 layers are software-decoded on CPU (~1.2 cores for a 4K60 clip) and
+re-uploaded per frame with a full-device `WaitIdle`; a transfer-queue + fence path
+and display-size decode would cut that, left as future work.
 
 Not reported upstream (the repo is archived). Local patches.
 
