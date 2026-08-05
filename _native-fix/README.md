@@ -24,6 +24,16 @@ format field for `TEXB0003+`, skip the extra field for `TEXB0004+`, and take the
 FreeImage-decode path for `TEXB0003+` (not just `==3`). This fixed the
 `直到大地变成一颗酸橙` wallpaper (id 3776778760) — it now renders fully.
 
+## 3. In-scene video textures (`VideoTex.*`, `WPTexImageParser.cpp`)
+
+Some scene wallpapers use a playing **MP4/H.264 video as a layer texture** (the
+`.tex` payload is an `ftyp` MP4). The renderer treated the video bytes as raw
+pixels → noise. Added an ffmpeg-based decoder (`VideoTex.cpp`) and a branch in the
+texture parser that decodes a frame to RGBA. **Currently the first frame only**
+(static) — the content is correct instead of noise; continuous 60fps playback is
+not yet wired (it needs a streaming decoder + updatable texture + render-loop
+hook). Adds a build dependency on **ffmpeg** (libavcodec/format/util/swscale).
+
 Not reported upstream (the repo is archived). Local patches.
 
 ## Build / install / revert
@@ -37,7 +47,7 @@ cd we-build/src/backend_scene && git apply < .../renderer-fixes.patch && cd ../.
 # in the plasmabuild toolbox:
 sudo dnf install -y extra-cmake-modules kf6-plasma-devel kf6-kpackage-devel \
     qt6-qtdeclarative-devel qt6-qtbase-private-devel lz4-devel vulkan-loader-devel \
-    mesa-libGL-devel libglvnd-devel ninja-build glslang-devel mpv-libs-devel mpv-devel
+    mesa-libGL-devel libglvnd-devel ninja-build glslang-devel mpv-libs-devel mpv-devel ffmpeg-free-devel
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release -DUSE_PLASMAPKG=OFF -DBUILD_QML=ON
 make -j$(nproc)

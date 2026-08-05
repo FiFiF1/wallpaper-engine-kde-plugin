@@ -1,3 +1,172 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 8dd28c9..6234323 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -1,6 +1,7 @@
+ find_package(OpenGL REQUIRED)
+ find_package(Threads REQUIRED)
+ pkg_check_modules(LZ4 REQUIRED liblz4)
++pkg_check_modules(FFMPEG REQUIRED libavcodec libavformat libavutil libswscale)
+ 
+ option(ENABLE_RENDERDOC "Build with renderdoc api" OFF)
+ 
+@@ -46,6 +47,7 @@ add_library(
+   WPSceneParser.cpp
+   WPShaderValueUpdater.cpp
+   WPTexImageParser.cpp
++  VideoTex.cpp
+   WPSoundParser.cpp
+   WPMdlParser.cpp
+   WPPuppet.cpp
+@@ -65,8 +67,8 @@ set(InteralLib
+ target_link_libraries(
+   ${PROJECT_NAME}
+   PUBLIC wpUtils
+-  PRIVATE ${InteralLib} nlohmann_json ${LZ4_LIBRARIES}
++  PRIVATE ${InteralLib} nlohmann_json ${LZ4_LIBRARIES} ${FFMPEG_LIBRARIES}
+           ${CMAKE_THREAD_LIBS_INIT} ${CMAKE_DL_LIBS})
+ 
+-target_include_directories(${PROJECT_NAME} PUBLIC . Swapchain)
++target_include_directories(${PROJECT_NAME} PUBLIC . Swapchain PRIVATE ${FFMPEG_INCLUDE_DIRS})
+ set_property(TARGET ${PROJECT_NAME} PROPERTY POSITION_INDEPENDENT_CODE ON)
+diff --git a/src/VideoTex.cpp b/src/VideoTex.cpp
+new file mode 100644
+index 0000000..c0208c9
+--- /dev/null
++++ b/src/VideoTex.cpp
+@@ -0,0 +1,107 @@
++#include "VideoTex.hpp"
++#include "Utils/Logging.h"
++#include <cstring>
++
++extern "C" {
++#include <libavformat/avformat.h>
++#include <libavcodec/avcodec.h>
++#include <libswscale/swscale.h>
++#include <libavutil/imgutils.h>
++}
++
++namespace wallpaper {
++
++bool LooksLikeVideo(const uint8_t* data, size_t size) {
++    // ISO Base Media (MP4/MOV): a 'ftyp' box near the start.
++    if (size < 12) return false;
++    if (data[4] == 'f' && data[5] == 't' && data[6] == 'y' && data[7] == 'p') return true;
++    return false;
++}
++
++namespace
++{
++struct MemBuf { const uint8_t* data; size_t size; size_t pos; };
++
++int read_cb(void* opaque, uint8_t* buf, int bufsz) {
++    auto* m = static_cast<MemBuf*>(opaque);
++    size_t remain = m->size - m->pos;
++    if (remain == 0) return AVERROR_EOF;
++    size_t n = (static_cast<size_t>(bufsz) < remain) ? static_cast<size_t>(bufsz) : remain;
++    std::memcpy(buf, m->data + m->pos, n);
++    m->pos += n;
++    return static_cast<int>(n);
++}
++int64_t seek_cb(void* opaque, int64_t offset, int whence) {
++    auto* m = static_cast<MemBuf*>(opaque);
++    if (whence == AVSEEK_SIZE) return static_cast<int64_t>(m->size);
++    int64_t np;
++    if (whence == SEEK_SET) np = offset;
++    else if (whence == SEEK_CUR) np = static_cast<int64_t>(m->pos) + offset;
++    else if (whence == SEEK_END) np = static_cast<int64_t>(m->size) + offset;
++    else return -1;
++    if (np < 0 || static_cast<size_t>(np) > m->size) return -1;
++    m->pos = static_cast<size_t>(np);
++    return np;
++}
++} // namespace
++
++bool DecodeVideoFirstFrame(const uint8_t* data, size_t size,
++                           std::vector<uint8_t>& out_rgba, int& out_w, int& out_h) {
++    MemBuf mb { data, size, 0 };
++    const int BSZ = 1 << 16;
++    uint8_t* avio_buf = static_cast<uint8_t*>(av_malloc(static_cast<size_t>(BSZ)));
++    AVIOContext* avio = avio_alloc_context(avio_buf, BSZ, 0, &mb, read_cb, nullptr, seek_cb);
++    AVFormatContext* fmt = avformat_alloc_context();
++    fmt->pb = avio;
++
++    bool ok = false;
++    AVCodecContext* ctx = nullptr;
++    AVPacket* pkt = nullptr;
++    AVFrame* frame = nullptr;
++
++    if (avformat_open_input(&fmt, nullptr, nullptr, nullptr) < 0) { LOG_ERROR("video: open failed"); goto cleanup_avio; }
++    if (avformat_find_stream_info(fmt, nullptr) < 0) { LOG_ERROR("video: no stream info"); goto cleanup_fmt; }
++    {
++        int vs = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
++        if (vs < 0) { LOG_ERROR("video: no video stream"); goto cleanup_fmt; }
++        AVCodecParameters* par = fmt->streams[vs]->codecpar;
++        const AVCodec* dec = avcodec_find_decoder(par->codec_id);
++        if (! dec) { LOG_ERROR("video: no decoder"); goto cleanup_fmt; }
++        ctx = avcodec_alloc_context3(dec);
++        avcodec_parameters_to_context(ctx, par);
++        if (avcodec_open2(ctx, dec, nullptr) < 0) { LOG_ERROR("video: codec open failed"); goto cleanup_ctx; }
++        pkt = av_packet_alloc();
++        frame = av_frame_alloc();
++        while (av_read_frame(fmt, pkt) >= 0) {
++            if (pkt->stream_index == vs && avcodec_send_packet(ctx, pkt) == 0 &&
++                avcodec_receive_frame(ctx, frame) == 0) {
++                int w = frame->width, h = frame->height;
++                out_rgba.resize(static_cast<size_t>(w) * static_cast<size_t>(h) * 4u);
++                SwsContext* sws = sws_getContext(w, h, static_cast<AVPixelFormat>(frame->format),
++                                                 w, h, AV_PIX_FMT_RGBA, SWS_BILINEAR,
++                                                 nullptr, nullptr, nullptr);
++                uint8_t* dst[4] = { out_rgba.data(), nullptr, nullptr, nullptr };
++                int dstst[4] = { w * 4, 0, 0, 0 };
++                sws_scale(sws, frame->data, frame->linesize, 0, h, dst, dstst);
++                sws_freeContext(sws);
++                out_w = w; out_h = h; ok = true;
++                break;
++            }
++            av_packet_unref(pkt);
++        }
++        if (frame) av_frame_free(&frame);
++        if (pkt) av_packet_free(&pkt);
++    }
++cleanup_ctx:
++    if (ctx) avcodec_free_context(&ctx);
++cleanup_fmt:
++    avformat_close_input(&fmt);
++    if (avio) { av_freep(&avio->buffer); avio_context_free(&avio); }
++    return ok;
++cleanup_avio:
++    if (fmt) avformat_free_context(fmt);
++    if (avio) { av_freep(&avio->buffer); avio_context_free(&avio); }
++    return false;
++}
++
++} // namespace wallpaper
+diff --git a/src/VideoTex.hpp b/src/VideoTex.hpp
+new file mode 100644
+index 0000000..3eace62
+--- /dev/null
++++ b/src/VideoTex.hpp
+@@ -0,0 +1,19 @@
++#pragma once
++// Decode a video (MP4/H.264) that Wallpaper Engine packed inside a scene .tex.
++// Some scene wallpapers use a playing video as a layer texture; the .tex payload
++// is then an ISO-BMFF/MP4 stream rather than pixel data.
++#include <cstdint>
++#include <cstddef>
++#include <vector>
++
++namespace wallpaper {
++
++// Cheap sniff: does this buffer start with an MP4/ISO-BMFF 'ftyp' box?
++bool LooksLikeVideo(const uint8_t* data, size_t size);
++
++// Decode the first frame of an in-memory video to tightly-packed RGBA8.
++// Returns false if it is not a decodable video.
++bool DecodeVideoFirstFrame(const uint8_t* data, size_t size,
++                           std::vector<uint8_t>& out_rgba, int& out_w, int& out_h);
++
++} // namespace wallpaper
 diff --git a/src/WPShaderParser.cpp b/src/WPShaderParser.cpp
 index 7c3eaec..ba4a4f4 100644
 --- a/src/WPShaderParser.cpp
@@ -17,10 +186,17 @@ index 7c3eaec..ba4a4f4 100644
           it != std::sregex_iterator();
           it++) {
 diff --git a/src/WPTexImageParser.cpp b/src/WPTexImageParser.cpp
-index ec396e4..a097b23 100644
+index ec396e4..1c2f6c9 100644
 --- a/src/WPTexImageParser.cpp
 +++ b/src/WPTexImageParser.cpp
-@@ -110,7 +110,16 @@ void LoadHeader(fs::IBinaryStream& file, ImageHeader& header) {
+@@ -1,4 +1,6 @@
+ #include "WPTexImageParser.hpp"
++#include "VideoTex.hpp"
++#include <vector>
+ 
+ #include "Type.hpp"
+ #include "WPCommon.hpp"
+@@ -110,7 +112,16 @@ void LoadHeader(fs::IBinaryStream& file, ImageHeader& header) {
  
      header.count = file.ReadInt32();
  
@@ -38,12 +214,39 @@ index ec396e4..a097b23 100644
  }
  
  void SetHeaderPow2(ImageHeader& header, i32 mip_0_w, i32 mip_0_h) {
-@@ -185,7 +194,7 @@ std::shared_ptr<Image> WPTexImageParser::Parse(const std::string& name) {
+@@ -184,8 +195,34 @@ std::shared_ptr<Image> WPTexImageParser::Parse(const std::string& name) {
+                     return nullptr;
                  }
              }
++            // is video (MP4/H.264 packed into a scene texture) - some WE scenes
++            // use a playing video as a layer; decode a frame instead of treating
++            // the stream as raw pixels (which showed as noise).
++            if (LooksLikeVideo((const uint8_t*)result, (usize)src_size)) {
++                std::vector<uint8_t> rgba;
++                int                  vw = 0, vh = 0;
++                if (DecodeVideoFirstFrame((const uint8_t*)result, (usize)src_size, rgba, vw, vh)) {
++                    mipmap.width  = vw;
++                    mipmap.height = vh;
++                    if (i_mipmap == 0) {
++                        img_slot.width  = vw;
++                        img_slot.height = vh;
++                        SetHeaderPow2(img.header, vw, vh);
++                    }
++                    img.header.format = TextureFormat::RGBA8;
++                    src_size          = vw * vh * 4;
++                    mipmap.data       = ImageDataPtr(new uint8_t[(usize)src_size],
++                                               [](uint8_t* d) { delete[] d; });
++                    std::copy(rgba.begin(), rgba.end(), mipmap.data.get());
++                } else {
++                    LOG_ERROR("video texture decode failed");
++                    mipmap.data = ImageDataPtr(new uint8_t[(usize)src_size],
++                                               [](uint8_t* d) { delete[] d; });
++                    std::copy(result, result + src_size, mipmap.data.get());
++                }
++            }
              // is image container
 -            if (img.header.extraHeader["texb"].val == 3 && img.header.type != ImageType::UNKNOWN) {
-+            if (img.header.extraHeader["texb"].val >= 3 && img.header.type != ImageType::UNKNOWN) {
++            else if (img.header.extraHeader["texb"].val >= 3 && img.header.type != ImageType::UNKNOWN) {
                  int32_t w, h, n;
                  auto*   data =
                      stbi_load_from_memory((const unsigned char*)result, src_size, &w, &h, &n, 4);

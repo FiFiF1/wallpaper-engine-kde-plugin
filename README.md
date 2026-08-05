@@ -75,10 +75,10 @@ Inherited from upstream — the plugin is a partial reimplementation, not all of
 Wallpaper Engine. Scenes using these still load, just without the effect (or, for
 video textures, may need reverting):
 
-- **In-scene video / animated textures** — some scene wallpapers embed MP4 video as
-  a layer texture (often "4k/60fps" ones); the scene renderer doesn't decode video
-  textures, so those layers show noise. (Standalone *video-type* wallpapers work
-  fine via the mpv backend — this gap is only videos used *inside* a scene.)
+- **In-scene video textures** — some scene wallpapers embed MP4 video as a layer
+  texture (often "4k/60fps" ones). This fork **decodes them** (via ffmpeg) so they
+  render correctly instead of as noise — but currently shows the **first frame**
+  only; continuous 60fps playback of in-scene video is not yet implemented.
 - **Audio-reactive shaders** (`g_AudioSpectrum*`) — no audio FFT is fed to shaders.
 - **Shadow atlas / dynamic 2D lighting / light cookies** — not implemented.
 - Some custom effect shaders relying on WE-specific HLSL semantics may not compile.
