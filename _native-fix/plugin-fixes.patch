@@ -1,0 +1,130 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index f5a539b..da43da8 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -15,6 +15,7 @@ add_library(${PROJECT_NAME}
+ 	MouseGrabber.cpp
+ 	TTYSwitchMonitor.cpp
+     PluginInfo.cpp
++	WebAudioSpectrum.cpp
+ 	qmldir
+ )
+ 
+@@ -24,9 +25,12 @@ target_link_libraries(${PROJECT_NAME}
+ 	Qt::Qml 
+ 	mpvbackend
+ 	wescene-renderer-qml
++	wpAudio
+ 	Qt::Core
+ 	Qt::DBus
+ )
++target_include_directories(${PROJECT_NAME} PRIVATE
++	${CMAKE_CURRENT_LIST_DIR}/backend_scene/src/Audio/include)
+ set_target_properties(${PROJECT_NAME} PROPERTIES CXX_VISIBILITY_PRESET hidden)
+ set_target_properties(${PROJECT_NAME}
+                        PROPERTIES LINK_FLAGS "-Wl,--exclude-libs,ALL")
+diff --git a/src/WebAudioSpectrum.cpp b/src/WebAudioSpectrum.cpp
+new file mode 100644
+index 0000000..41df8cc
+--- /dev/null
++++ b/src/WebAudioSpectrum.cpp
+@@ -0,0 +1,22 @@
++#include "WebAudioSpectrum.hpp"
++#include "Audio/AudioCapture.hpp"
++
++namespace wekde {
++
++WebAudioSpectrum::WebAudioSpectrum(QObject* parent)
++    : QObject(parent), m_ref(std::make_unique<wallpaper::AudioCaptureRef>()) {}
++
++WebAudioSpectrum::~WebAudioSpectrum() = default;
++
++QVariantList WebAudioSpectrum::spectrum() const {
++    wallpaper::AudioSpectrumWide left {}, right {};
++    wallpaper::AudioCapture::Instance().GetSpectrumWide(left, right);
++
++    QVariantList out;
++    out.reserve((int)left.size());
++    for (std::size_t i = 0; i < left.size(); i++)
++        out.append((double)((left[i] + right[i]) * 0.5f));
++    return out;
++}
++
++} // namespace wekde
+diff --git a/src/WebAudioSpectrum.hpp b/src/WebAudioSpectrum.hpp
+new file mode 100644
+index 0000000..f26bbb7
+--- /dev/null
++++ b/src/WebAudioSpectrum.hpp
+@@ -0,0 +1,42 @@
++#pragma once
++#include <QObject>
++#include <QVariantList>
++#include <memory>
++
++namespace wallpaper {
++class AudioCaptureRef;
++}
++
++namespace wekde {
++
++// QML-exposed audio spectrum for WEB wallpapers (QtWebEngine pages), which
++// have no route to the native Vulkan renderer's own g_AudioSpectrum16Left/
++// Right uniforms (those only reach scene wallpapers' shaders). Wraps the same
++// wallpaper::AudioCapture used there, but at a wider resolution: Wallpaper
++// Engine's own web audio callback delivers >=64 samples (confirmed against a
++// real installed web wallpaper's JS, which reads audioArray[0..63]), unlike
++// the scene backend's fixed 16 bands.
++//
++// Capture is acquired for as long as one of these objects exists (RAII, via
++// AudioCaptureRef) and shared process-wide with any concurrently-live scene
++// audio use - see AudioCapture.cpp. Instantiating this type from QML with no
++// polling costs nothing beyond the acquire; QML (QtWebView.qml) is
++// responsible for polling spectrum() on a Timer and forwarding it to the
++// page's sigAudio.
++class WebAudioSpectrum : public QObject {
++    Q_OBJECT
++
++public:
++    WebAudioSpectrum(QObject* parent = nullptr);
++    ~WebAudioSpectrum();
++
++    // Mono spectrum (average of the underlying left/right capture), 64
++    // log-spaced bands 30Hz-16kHz, each roughly 0..1. QVariantList so QML/JS
++    // gets a plain array with no extra type registration.
++    Q_INVOKABLE QVariantList spectrum() const;
++
++private:
++    std::unique_ptr<wallpaper::AudioCaptureRef> m_ref;
++};
++
++} // namespace wekde
+diff --git a/src/plugin.cpp b/src/plugin.cpp
+index 4bc817e..aaefde8 100644
+--- a/src/plugin.cpp
++++ b/src/plugin.cpp
+@@ -6,6 +6,7 @@
+ #include "MouseGrabber.hpp"
+ #include "TTYSwitchMonitor.hpp"
+ #include "PluginInfo.hpp"
++#include "WebAudioSpectrum.hpp"
+ 
+ constexpr std::array<uint, 2> WPVer { 1, 2 };
+ 
+@@ -22,6 +23,7 @@ public:
+         std::setlocale(LC_NUMERIC, "C");
+         qmlRegisterType<mpv::MpvObject>(uri, WPVer[0], WPVer[1], "Mpv");
+         qmlRegisterType<wekde::TTYSwitchMonitor>(uri, WPVer[0], WPVer[1], "TTYSwitchMonitor");
++        qmlRegisterType<wekde::WebAudioSpectrum>(uri, WPVer[0], WPVer[1], "WebAudioSpectrum");
+     }
+ };
+ 
+diff --git a/src/qmldir b/src/qmldir
+index b3eb1db..118a30f 100644
+--- a/src/qmldir
++++ b/src/qmldir
+@@ -4,3 +4,4 @@ classname PluginInfo
+ classname MouseGrabber
+ classname SceneViewer
+ classname Mpv
++classname WebAudioSpectrum

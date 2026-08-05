@@ -1,9 +1,9 @@
 diff --git a/src/Audio/AudioCapture.cpp b/src/Audio/AudioCapture.cpp
 new file mode 100644
-index 0000000..a2b5fda
+index 0000000..2de20fb
 --- /dev/null
 +++ b/src/Audio/AudioCapture.cpp
-@@ -0,0 +1,300 @@
+@@ -0,0 +1,367 @@
 +#include "Audio/AudioCapture.hpp"
 +#include "Utils/Logging.h"
 +
@@ -38,6 +38,20 @@ index 0000000..a2b5fda
 +constexpr float BAND_EDGES[AUDIO_BANDS + 1] = { 30,   60,   95,   140,  200,  280,
 +                                                400,  550,  760,  1050, 1450, 2000,
 +                                                2800, 4000, 6000, 9000, 16000 };
++
++// Same range, 64 log-spaced bands - for consumers needing finer resolution
++// than the scene shader uniforms (see AudioCapture.hpp).
++constexpr float BAND_EDGES_WIDE[AUDIO_BANDS_WIDE + 1] = {
++    30.0f,    33.1f,    36.5f,    40.3f,    44.4f,    49.0f,    54.0f,    59.6f,
++    65.8f,    72.5f,    80.0f,    88.3f,    97.4f,    107.4f,   118.5f,   130.7f,
++    144.2f,   159.0f,   175.4f,   193.5f,   213.5f,   235.5f,   259.7f,   286.5f,
++    316.0f,   348.6f,   384.6f,   424.2f,   467.9f,   516.2f,   569.4f,   628.1f,
++    692.8f,   764.2f,   843.0f,   929.9f,   1025.8f,  1131.5f,  1248.2f,  1376.8f,
++    1518.8f,  1675.3f,  1848.1f,  2038.6f,  2248.7f,  2480.5f,  2736.2f,  3018.3f,
++    3329.4f,  3672.7f,  4051.2f,  4468.9f,  4929.6f,  5437.7f,  5998.3f,  6616.6f,
++    7298.7f,  8051.1f,  8881.0f,  9796.6f,  10806.4f, 11920.4f, 13149.3f, 14504.8f,
++    16000.0f,
++};
 +
 +// In-place iterative radix-2 FFT. `re`/`im` are FFT_SIZE long.
 +void fft(float* re, float* im) {
@@ -100,6 +114,16 @@ index 0000000..a2b5fda
 +    AudioSpectrum                         out_r {};
 +    std::chrono::steady_clock::time_point last_analysis {};
 +    bool                                  have_analysis { false };
++
++    // Independent cache for the wide spectrum: separate smoothing state (the
++    // fast-attack/slow-release memory in analyse_channel_into is per band
++    // count) and a separate due-check, so polling one resolution doesn't
++    // perturb the other's timing.
++    std::mutex                            out_mtx_wide;
++    AudioSpectrumWide                     out_l_wide {};
++    AudioSpectrumWide                     out_r_wide {};
++    std::chrono::steady_clock::time_point last_analysis_wide {};
++    bool                                  have_analysis_wide { false };
 +
 +    // Windowing table (Hann), precomputed.
 +    std::array<float, FFT_SIZE> window {};
@@ -206,14 +230,23 @@ index 0000000..a2b5fda
 +            ring_r.fill(0.0f);
 +            wpos = 0;
 +        }
-+        std::lock_guard<std::mutex> lk(out_mtx);
-+        out_l.fill(0.0f);
-+        out_r.fill(0.0f);
-+        have_analysis = false;
++        {
++            std::lock_guard<std::mutex> lk(out_mtx);
++            out_l.fill(0.0f);
++            out_r.fill(0.0f);
++            have_analysis = false;
++        }
++        std::lock_guard<std::mutex> lk(out_mtx_wide);
++        out_l_wide.fill(0.0f);
++        out_r_wide.fill(0.0f);
++        have_analysis_wide = false;
 +    }
 +
-+    void analyse_channel(const std::array<float, FFT_SIZE>& src, std::size_t start,
-+                         AudioSpectrum& prev) {
++    // Shared by both band counts: FFT the ring buffer once, then reduce into
++    // whichever band-edge table/output array the caller asks for.
++    template<std::size_t N>
++    void analyse_channel_into(const std::array<float, FFT_SIZE>& src, std::size_t start,
++                              const float (&band_edges)[N + 1], std::array<float, N>& prev) {
 +        static thread_local std::vector<float> re, im;
 +        re.assign(FFT_SIZE, 0.0f);
 +        im.assign(FFT_SIZE, 0.0f);
@@ -222,9 +255,9 @@ index 0000000..a2b5fda
 +        fft(re.data(), im.data());
 +
 +        const float bin_hz = (float)RATE / (float)FFT_SIZE;
-+        for (std::size_t b = 0; b < AUDIO_BANDS; b++) {
-+            const auto k0 = (std::size_t)std::max(1.0f, BAND_EDGES[b] / bin_hz);
-+            auto       k1 = (std::size_t)(BAND_EDGES[b + 1] / bin_hz);
++        for (std::size_t b = 0; b < N; b++) {
++            const auto k0 = (std::size_t)std::max(1.0f, band_edges[b] / bin_hz);
++            auto       k1 = (std::size_t)(band_edges[b + 1] / bin_hz);
 +            k1            = std::min(k1, FFT_BINS - 1);
 +            float peak    = 0.0f;
 +            for (std::size_t k = k0; k <= k1 && k < FFT_BINS; k++) {
@@ -241,20 +274,34 @@ index 0000000..a2b5fda
 +        }
 +    }
 +
++    bool snapshot_ring(std::array<float, FFT_SIZE>& l, std::array<float, FFT_SIZE>& r,
++                       std::size_t& start) {
++        std::lock_guard<std::mutex> lk(mtx);
++        if (! got_audio) return false;
++        l     = ring_l;
++        r     = ring_r;
++        start = wpos; // oldest sample
++        return true;
++    }
++
 +    void analyse() {
 +        std::array<float, FFT_SIZE> l, r;
 +        std::size_t                 start;
-+        {
-+            std::lock_guard<std::mutex> lk(mtx);
-+            if (! got_audio) return;
-+            l     = ring_l;
-+            r     = ring_r;
-+            start = wpos; // oldest sample
-+        }
++        if (! snapshot_ring(l, r, start)) return;
 +        std::lock_guard<std::mutex> lk(out_mtx);
-+        analyse_channel(l, start, out_l);
-+        analyse_channel(r, start, out_r);
++        analyse_channel_into<AUDIO_BANDS>(l, start, BAND_EDGES, out_l);
++        analyse_channel_into<AUDIO_BANDS>(r, start, BAND_EDGES, out_r);
 +        have_analysis = true;
++    }
++
++    void analyse_wide() {
++        std::array<float, FFT_SIZE> l, r;
++        std::size_t                 start;
++        if (! snapshot_ring(l, r, start)) return;
++        std::lock_guard<std::mutex> lk(out_mtx_wide);
++        analyse_channel_into<AUDIO_BANDS_WIDE>(l, start, BAND_EDGES_WIDE, out_l_wide);
++        analyse_channel_into<AUDIO_BANDS_WIDE>(r, start, BAND_EDGES_WIDE, out_r_wide);
++        have_analysis_wide = true;
 +    }
 +};
 +
@@ -303,6 +350,26 @@ index 0000000..a2b5fda
 +    right = m_impl->out_r;
 +}
 +
++void AudioCapture::GetSpectrumWide(AudioSpectrumWide& left, AudioSpectrumWide& right) {
++    if (! m_impl->running) {
++        left.fill(0.0f);
++        right.fill(0.0f);
++        return;
++    }
++    const auto now = std::chrono::steady_clock::now();
++    bool       due = false;
++    {
++        std::lock_guard<std::mutex> lk(m_impl->out_mtx_wide);
++        due = ! m_impl->have_analysis_wide || (now - m_impl->last_analysis_wide) >= MIN_PERIOD;
++        if (due) m_impl->last_analysis_wide = now;
++    }
++    if (due) m_impl->analyse_wide();
++
++    std::lock_guard<std::mutex> lk(m_impl->out_mtx_wide);
++    left  = m_impl->out_l_wide;
++    right = m_impl->out_r_wide;
++}
++
 +} // namespace wallpaper
 diff --git a/src/Audio/CMakeLists.txt b/src/Audio/CMakeLists.txt
 index c36fd68..5ad2932 100644
@@ -318,10 +385,10 @@ index c36fd68..5ad2932 100644
  target_link_libraries(${LIB_NAME}
 diff --git a/src/Audio/include/Audio/AudioCapture.hpp b/src/Audio/include/Audio/AudioCapture.hpp
 new file mode 100644
-index 0000000..d675849
+index 0000000..4a442ee
 --- /dev/null
 +++ b/src/Audio/include/Audio/AudioCapture.hpp
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,74 @@
 +#pragma once
 +// System-audio capture + spectrum analysis for audio-reactive scenes.
 +//
@@ -345,6 +412,12 @@ index 0000000..d675849
 +inline constexpr std::size_t AUDIO_BANDS = 16;
 +using AudioSpectrum                      = std::array<float, AUDIO_BANDS>;
 +
++// Wider spectrum for consumers that are not the fixed-16-band scene shader
++// uniforms - currently just the web-wallpaper QML bridge (WebAudioSpectrum),
++// whose JS-side callback convention expects >=64 samples.
++inline constexpr std::size_t AUDIO_BANDS_WIDE = 64;
++using AudioSpectrumWide                       = std::array<float, AUDIO_BANDS_WIDE>;
++
 +class AudioCapture {
 +public:
 +    // Process-wide instance. Never null; safe to use even if capture fails
@@ -361,6 +434,11 @@ index 0000000..d675849
 +    // every node in every scene can call it freely. Returns silence when
 +    // capture is unavailable.
 +    void GetSpectrum(AudioSpectrum& left, AudioSpectrum& right);
++
++    // Same analysis, 64 log-spaced bands instead of 16. Independent cache
++    // from GetSpectrum() (see .cpp) so a consumer of one resolution doesn't
++    // pay for or invalidate the other's cache.
++    void GetSpectrumWide(AudioSpectrumWide& left, AudioSpectrumWide& right);
 +
 +    // True once a capture device is actually open and delivering samples.
 +    bool active() const;

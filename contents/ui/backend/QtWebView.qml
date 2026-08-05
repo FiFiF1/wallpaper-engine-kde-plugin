@@ -25,6 +25,23 @@ Item {
         visible: true
         enabled: false
     }
+    // Feeds webobj.sigAudio from the native AudioCapture (system audio ->
+    // FFT), so window.wallpaperRegisterAudioListener callbacks in the page
+    // actually receive data - previously sigAudio was declared and consumed
+    // (see below and main.js of any audio-reactive web wallpaper) but never
+    // emitted from anywhere, so every such wallpaper sat permanently idle
+    // regardless of what was playing. Loaded by file path (matching the same
+    // hasLib-gated pattern main.qml uses for backend/Scene.qml), not a
+    // top-level import in this file, so a missing native bundle degrades to
+    // "no reactive audio" rather than breaking web wallpapers outright - a
+    // Loader whose source fails to resolve reports Loader.Error without
+    // affecting this document. See WebAudioBridge.qml.
+    Loader {
+        id: audioLoader
+        source: webItem.hasLib ? "WebAudioBridge.qml" : ""
+        onLoaded: audioLoader.item.target = webobj
+    }
+
     QtObject {
         id: webobj
         WebChannel.id: "wpeQml"

@@ -1,7 +1,11 @@
 # Native renderer fixes
 
-Two patches to `catsout/wallpaper-scene-renderer` (the C++ scene renderer built
-into `libWallpaperEngineKde.so`). Combined diff: `renderer-fixes.patch`.
+Patches to the two repos that build `libWallpaperEngineKde.so`:
+- `renderer-fixes.patch` — `catsout/wallpaper-scene-renderer`, the scene
+  renderer submodule (`we-build/src/backend_scene`). Fixes 1-6 below.
+- `plugin-fixes.patch` — the outer plugin repo itself
+  (`catsout/wallpaper-engine-kde-plugin`, `we-build/src/`: `plugin.cpp`,
+  `CMakeLists.txt`, `qmldir`, and new `WebAudioSpectrum.*`). Fix 7 below.
 
 ## 1. Shader-preprocessor stack overflow (`WPShaderParser.cpp`)
 
@@ -117,6 +121,51 @@ installed wallpapers, none enable `LIGHTS_SHADOW_MAPPING` or `LIGHTS_COOKIE`.
 
 Result: scene loads are now free of renderer errors.
 
+## 7. Web-wallpaper audio-reactive visualizers never reacted (`WebAudioSpectrum.*`, `plugin.cpp`, `QtWebView.qml`)
+
+Web wallpapers (QtWebEngine pages) get an audio hookup via
+`window.wallpaperRegisterAudioListener(listener)`, which QML wires to
+`wpeQml.sigAudio.connect(listener)` (`contents/ui/backend/QtWebView.qml`,
+plasma package side). **`sigAudio` was declared and consumed but never
+emitted from anywhere in the codebase** — confirmed by grep, zero emit sites.
+Every audio-reactive web wallpaper (e.g. "Simplistic Audio Visualizer",
+workshop id 923576681) therefore sat permanently idle no matter what was
+playing — not "quiet by design", genuinely dead regardless of audio, verified
+by playing a tone directly at it before and after this fix.
+
+This is a *different* gap from fix 4 (`g_AudioSpectrum16Left/Right`): that one
+only reaches scene wallpapers' native Vulkan shaders. Web wallpapers run in
+QtWebEngine, a separate process/backend with no route to those uniforms.
+
+Fix: exposed the same underlying `AudioCapture` (fix 4) to QML as a new native
+type, `WebAudioSpectrum`, registered in the `com.github.catsout.wallpaperEngineKde`
+QML module (`plugin.cpp`). Since the web-wallpaper JS convention expects a
+wider array than the 16-band scene uniforms (verified against 923576681's
+`main.js`, which reads `audioArray[0..63]`), `AudioCapture` gained a second,
+independently-cached spectrum method (`GetSpectrumWide`, 64 log-spaced bands,
+sharing the FFT but not the smoothing state or cache timing with the 16-band
+path). A new `WebAudioBridge.qml` (its own file, not inlined into
+`QtWebView.qml`) instantiates `WebAudioSpectrum` and polls it on a 50ms Timer,
+calling `sigAudio(spectrum())`.
+
+**Loaded by file path (`Loader { source: "WebAudioBridge.qml" }`), not a
+top-level `import` in `QtWebView.qml` itself** — matching the exact pattern
+`main.qml` already uses for `backend/Scene.qml` (`hasLib`-gated). A bare
+top-level import would make *every* web wallpaper hard-depend on the native
+library bundle being installed, which currently only scene wallpapers do (the
+native bundle is a separate, sometimes-missing install — see
+`wekde-crashguard-self-heal` memory on Bazzite rebases deleting it). A Loader
+whose source fails to resolve reports `Loader.Error` without breaking the
+parent document, so a missing bundle now degrades to "no reactive audio", not
+"web wallpapers stop working".
+
+Verified live end-to-end on 923576681: silent baseline reads solid black
+(intentional — the wallpaper author set a black canvas background); playing a
+two-tone test signal produces the visualizer's actual bar rendering
+immediately, distinctly clustered at the two tones' frequencies; returns to
+the identical black baseline once audio stops. No coredumps across install +
+test cycles.
+
 Not reported upstream (the repo is archived). Local patches.
 
 ## Build / install / revert
@@ -127,6 +176,8 @@ Built in the `plasmabuild` fedora-44 toolbox (matches host Qt6 6.11 / KF6 6.28):
 git clone --recursive --depth 1 --shallow-submodules \
     https://github.com/catsout/wallpaper-engine-kde-plugin.git we-build
 cd we-build/src/backend_scene && git apply < .../renderer-fixes.patch && cd ../..
+git apply < .../plugin-fixes.patch    # from we-build/ - touches src/ directly
+cd ..
 # in the plasmabuild toolbox:
 sudo dnf install -y extra-cmake-modules kf6-plasma-devel kf6-kpackage-devel \
     qt6-qtdeclarative-devel qt6-qtbase-private-devel lz4-devel vulkan-loader-devel \
