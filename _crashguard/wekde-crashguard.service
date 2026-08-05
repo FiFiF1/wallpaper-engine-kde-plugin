@@ -1,0 +1,11 @@
+[Unit]
+Description=Watchdog that recovers the desktop when a Wallpaper Engine scene crashes plasmashell
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/wekde-crashguard --watch
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

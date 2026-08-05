@@ -1,0 +1,3 @@
+# Python bytecode cache (regenerated at runtime)
+__pycache__/
+*.pyc

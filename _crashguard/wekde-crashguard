@@ -1,0 +1,540 @@
+#!/usr/bin/env python3
+"""wekde-crashguard - recover the desktop when a Wallpaper Engine scene crashes
+plasmashell, and leave a clear record behind.
+
+The scene renderer is a native library (libWallpaperEngineKde.so). A malformed or
+pathological scene can crash it hard (e.g. a std::regex stack overflow in the
+shader preprocessor), which takes the whole plasmashell process down. Because the
+crashing wallpaper is saved in the desktop config, plasmashell then crash-loops on
+every restart.
+
+This guard runs when plasmashell fails. It:
+  1. Finds which scene(s) were loading when it died - precisely, from the
+     breadcrumbs main.qml drops (a file per scene, removed once the scene renders
+     its first frame); a scene that crashed leaves its breadcrumb behind. Falls
+     back to the journal if there are none.
+  2. Records each crash to ~/.local/share/wekde/crash-log.jsonl - one JSON object
+     per line, easy to read later.
+  3. Replaces that monitor's wallpaper with a generated error card (a plain image,
+     so it cannot itself crash) and blocklists the scene.
+  4. Restarts plasmashell.
+
+Run modes:
+  (default)        act for real: recover and restart plasmashell.
+  --dry-run DIR    operate on a copy of the config in DIR, change nothing live,
+                   never restart plasmashell; print what it would do.
+  --status         print the current blocklist and recent crash log.
+"""
+
+import argparse
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+STATE_DIR = HOME / ".local" / "share" / "wekde"
+LOADING_DIR = STATE_DIR / "loading"
+BLOCKLIST = STATE_DIR / "blocked-scenes.json"
+CRASHLOG = STATE_DIR / "crash-log.jsonl"
+CARDS_DIR = STATE_DIR / "error-cards"
+APPLETSRC = HOME / ".config" / "plasma-org.kde.plasma.desktop-appletsrc"
+WP_PLUGIN = "com.github.catsout.wallpaperEngineKde"
+APPID = "431960"
+
+
+def now_iso():
+    # localtime without importing datetime.now under a frozen clock elsewhere
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
+
+
+def ensure_dirs():
+    for d in (STATE_DIR, LOADING_DIR, CARDS_DIR):
+        d.mkdir(parents=True, exist_ok=True)
+
+
+# --------------------------------------------------------------- config parsing
+class Appletsrc:
+    """Minimal reader/writer for the plasma appletsrc KConfig file, group-aware
+    enough to find each containment's wallpaper and rewrite one in place."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.lines = self.path.read_text(encoding="utf-8").splitlines()
+
+    def _group_bounds(self, header: str):
+        start = None
+        for i, ln in enumerate(self.lines):
+            if ln.strip() == header:
+                start = i
+                break
+        if start is None:
+            return None
+        end = len(self.lines)
+        for j in range(start + 1, len(self.lines)):
+            if self.lines[j].startswith("[") and self.lines[j].rstrip().endswith("]"):
+                end = j
+                break
+        return (start, end)
+
+    def containment_ids(self):
+        ids = []
+        for ln in self.lines:
+            m = re.match(r"^\[Containments\]\[(\d+)\]$", ln.strip())
+            if m:
+                ids.append(m.group(1))
+        return ids
+
+    def get(self, header: str, key: str):
+        b = self._group_bounds(header)
+        if not b:
+            return None
+        for i in range(b[0] + 1, b[1]):
+            m = re.match(r"^([^=\[]+)(\[\$e\])?=(.*)$", self.lines[i])
+            if m and m.group(1).strip() == key:
+                return m.group(3)
+        return None
+
+    def set(self, header: str, key: str, value: str):
+        b = self._group_bounds(header)
+        if not b:
+            # create the group at end of file
+            if self.lines and self.lines[-1].strip() != "":
+                self.lines.append("")
+            self.lines.append(header)
+            self.lines.append("%s=%s" % (key, value))
+            return
+        for i in range(b[0] + 1, b[1]):
+            m = re.match(r"^([^=\[]+)(\[\$e\])?=", self.lines[i])
+            if m and m.group(1).strip() == key:
+                self.lines[i] = "%s=%s" % (key, value)
+                return
+        # key not present: insert just after the header
+        self.lines.insert(b[0] + 1, "%s=%s" % (key, value))
+
+    def wallpaper_engine_containments(self):
+        """Return [{cid, wid, source}] for every containment currently using the
+        Wallpaper Engine plugin."""
+        out = []
+        for cid in self.containment_ids():
+            plugin = self.get("[Containments][%s]" % cid, "wallpaperplugin")
+            if plugin != WP_PLUGIN:
+                continue
+            wp = "[Containments][%s][Wallpaper][%s][General]" % (cid, WP_PLUGIN)
+            wid = self.get(wp, "WallpaperWorkShopId")
+            src = self.get(wp, "WallpaperSource")
+            out.append({"cid": cid, "wid": (wid or "").strip(), "source": src})
+        return out
+
+    def switch_to_error_card(self, cid: str, image_path: str):
+        self.set("[Containments][%s]" % cid, "wallpaperplugin", "org.kde.image")
+        img = "[Containments][%s][Wallpaper][org.kde.image][General]" % cid
+        self.set(img, "Image", "file://" + image_path)
+        self.set(img, "SlidePaths", "")
+
+    def save(self):
+        self.path.write_text("\n".join(self.lines) + "\n", encoding="utf-8")
+
+
+# --------------------------------------------------------------- crash identity
+def stale_breadcrumbs():
+    if not LOADING_DIR.is_dir():
+        return []
+    return [Path(p).name for p in glob.glob(str(LOADING_DIR / "*"))]
+
+
+def journal_loading_scenes():
+    """Scene ids seen in 'loading scene: .../<id>/scene.json' in the last minutes
+    of the plasmashell journal - fallback when there are no breadcrumbs."""
+    try:
+        out = subprocess.run(
+            ["journalctl", "--user", "-u", "plasma-plasmashell",
+             "--since", "-3min", "--no-pager"],
+            capture_output=True, text=True, timeout=20).stdout
+    except Exception:
+        return []
+    ids = re.findall(r"content/%s/(\d+)/scene\.json" % APPID, out)
+    seen, ordered = set(), []
+    for i in reversed(ids):        # most recent first
+        if i not in seen:
+            seen.add(i)
+            ordered.append(i)
+    return ordered
+
+
+def last_plasmashell_core():
+    """Signal name and a short native backtrace of the most recent plasmashell
+    crash, for the record. Best-effort - returns ('', []) if unavailable."""
+    try:
+        out = subprocess.run(
+            ["coredumpctl", "info", "plasmashell"],
+            capture_output=True, text=True, timeout=20).stdout
+    except Exception:
+        return "", []
+    sig = ""
+    m = re.search(r"Signal:\s*\d+\s*\(([A-Z]+)\)", out)
+    if m:
+        sig = m.group(1)
+    frames = re.findall(r"#\d+\s+0x[0-9a-f]+\s+(\S+)", out)
+    # keep the frames that name the wallpaper engine, plus a few for context
+    wp = [f for f in frames if "WallpaperEngine" in f]
+    summary = (wp[:6] if wp else frames[:8])
+    return sig, summary
+
+
+# --------------------------------------------------------------- outputs
+def read_blocklist():
+    try:
+        return json.loads(BLOCKLIST.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def write_blocklist(d):
+    BLOCKLIST.write_text(json.dumps(d, indent=2), encoding="utf-8")
+
+
+def append_crashlog(rec):
+    with CRASHLOG.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(rec) + "\n")
+
+
+def make_error_card(wid: str, title: str) -> str:
+    """A dark image stating which wallpaper was disabled and where to look. Uses
+    Pillow; falls back to ImageMagick; returns the path (may be a prior card)."""
+    path = CARDS_DIR / ("crashed-%s.png" % wid)
+    lines = [
+        "Wallpaper disabled after a crash",
+        "",
+        "This scene crashed the desktop and was",
+        "automatically turned off so it could recover.",
+        "",
+        "Workshop id: %s" % wid,
+        (title or "").strip(),
+        "",
+        "Re-enable it from Wallpaper settings once fixed.",
+        "Details: ~/.local/share/wekde/crash-log.jsonl",
+    ]
+    text = "\n".join(l for l in lines if l is not None)
+
+    def resolve_font():
+        # A CJK-capable sans covers both the English notice and Chinese/Japanese
+        # titles; fall back through plain sans to Pillow's default.
+        for query in ("Noto Sans CJK SC", "Noto Sans CJK", "sans"):
+            try:
+                p = subprocess.run(["fc-match", "-f", "%{file}", query],
+                                   capture_output=True, text=True, timeout=10).stdout.strip()
+                if p and Path(p).is_file():
+                    return p
+            except Exception:
+                pass
+        return ""
+
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        W, H = 1920, 1080
+        img = Image.new("RGB", (W, H), (24, 24, 28))
+        draw = ImageDraw.Draw(img)
+        fp = resolve_font()
+        try:
+            font = ImageFont.truetype(fp, 40) if fp else ImageFont.load_default()
+        except Exception:
+            font = ImageFont.load_default()
+        # rough vertical centering
+        y = H // 2 - (len(lines) * 52) // 2
+        for l in lines:
+            w = draw.textlength(l, font=font)
+            draw.text(((W - w) / 2, y), l, fill=(230, 210, 120), font=font)
+            y += 52
+        img.save(path)
+        return str(path)
+    except Exception:
+        pass
+    try:
+        subprocess.run(
+            ["convert", "-size", "1920x1080", "xc:#18181c",
+             "-fill", "#e6d278", "-gravity", "center",
+             "-pointsize", "40", "-annotate", "+0+0", text, str(path)],
+            check=True, timeout=30)
+        return str(path)
+    except Exception:
+        return ""
+
+
+# --------------------------------------------------------------- main action
+RUNLOG = STATE_DIR / "guard-runs"
+DISABLELOG = STATE_DIR / "recent-disables"
+STORMLOG = STATE_DIR / "storm"
+
+# After disabling the single crashing wallpaper, allow this many further crashes
+# before giving up and disabling every scene. "fails 3 times after that" -> the
+# 4th consecutive crash disables all.
+STORM_NUKE_AT = 4
+
+
+def storm_strike(window_s=90):
+    """Count consecutive crashes. A crash within window_s of the last one
+    continues the same storm; a longer gap starts fresh. Returns this crash's
+    number in the current storm (1 = first)."""
+    now = time.time()
+    last, count = 0.0, 0
+    if STORMLOG.is_file():
+        try:
+            parts = STORMLOG.read_text().split()
+            last, count = float(parts[0]), int(parts[1])
+        except Exception:
+            last, count = 0.0, 0
+    count = count + 1 if (now - last) < window_s else 1
+    try:
+        STORMLOG.write_text("%.0f %d" % (now, count))
+    except Exception:
+        pass
+    return count
+
+
+def read_last_applied(max_age_s=1800):
+    """The wallpaper the config dialog last applied, if recent - a strong hint at
+    the culprit, since a wallpaper usually crashes right after you switch to it."""
+    try:
+        parts = (STATE_DIR / "last-applied").read_text().split()
+        ts, wid = float(parts[0]), parts[1]
+        if time.time() - ts < max_age_s:
+            return wid
+    except Exception:
+        pass
+    return ""
+
+
+def recently_disabled(window_s=180):
+    """Scenes this guard disabled in the last window - so a crash storm walks
+    through the loading scenes one per cycle instead of re-picking the same one."""
+    now = time.time()
+    out = set()
+    if DISABLELOG.is_file():
+        try:
+            for ln in DISABLELOG.read_text().splitlines():
+                parts = ln.split()
+                if len(parts) == 2 and now - float(parts[0]) < window_s:
+                    out.add(parts[1])
+        except Exception:
+            pass
+    return out
+
+
+def note_disabled(wid):
+    now = time.time()
+    keep = []
+    if DISABLELOG.is_file():
+        try:
+            for ln in DISABLELOG.read_text().splitlines():
+                parts = ln.split()
+                if len(parts) == 2 and now - float(parts[0]) < 600:
+                    keep.append(ln)
+        except Exception:
+            pass
+    keep.append("%.0f %s" % (now, wid))
+    try:
+        DISABLELOG.write_text("\n".join(keep[-20:]) + "\n")
+    except Exception:
+        pass
+
+
+def recent_run_count(window_s=120):
+    """How many times this guard has run in the last window - used to escalate
+    to a last-resort recovery if normal identification keeps failing, so the
+    guard can never itself sustain a restart loop."""
+    now = time.time()
+    stamps = []
+    if RUNLOG.is_file():
+        try:
+            stamps = [float(x) for x in RUNLOG.read_text().split() if x]
+        except Exception:
+            stamps = []
+    stamps = [t for t in stamps if now - t < window_s]
+    stamps.append(now)
+    try:
+        RUNLOG.write_text(" ".join("%.0f" % t for t in stamps[-10:]))
+    except Exception:
+        pass
+    return len(stamps)
+
+
+def recover(appletsrc_path: Path, dry_run: bool):
+    ensure_dirs()
+    src = Appletsrc(appletsrc_path)
+    engines = src.wallpaper_engine_containments()
+    by_wid = {e["wid"]: e for e in engines if e["wid"]}
+
+    # Which scene crashed cannot be read from the crash itself, so start by
+    # disabling only the single most-likely culprit and see if that settles it.
+    # Only if the desktop keeps crashing after that do we widen to everything.
+    #
+    # Ranked suspects, best first:
+    #   1. breadcrumbs  - a scene main.qml marked as loading and that never
+    #      cleared, i.e. it was mid-parse when the shell died (most reliable);
+    #   2. last-applied - the wallpaper the config dialog just switched to;
+    #   3. journal      - scenes seen "loading" before the crash, newest first.
+    crumbs = [w for w in stale_breadcrumbs() if w in by_wid]
+    last = read_last_applied()
+    loading = [w for w in journal_loading_scenes() if w in by_wid]
+    already = recently_disabled()          # scenes turned off in this storm
+    strikes = 0 if dry_run else storm_strike()
+
+    ordered = []
+    for w in crumbs + ([last] if last in by_wid else []) + loading:
+        if w not in ordered:
+            ordered.append(w)
+    used_fallback = not crumbs
+
+    if strikes >= STORM_NUKE_AT:
+        # Disabling single wallpapers has not stopped the crashing after several
+        # tries - disable every scene so the desktop is guaranteed to recover.
+        suspects = [w for w in by_wid if w not in already] or list(by_wid)
+    else:
+        # Disable only the single most-likely crasher not yet tried this storm.
+        remaining = [w for w in ordered if w not in already]
+        if remaining:
+            suspects = [remaining[0]]
+        elif ordered:
+            suspects = [ordered[0]]
+        else:
+            suspects = []
+
+    sig, frames = last_plasmashell_core()
+    actions = []
+    for wid in suspects:
+        ent = by_wid[wid]
+        title = ""
+        try:
+            pj = (HOME / ".local/share/Steam/steamapps/workshop/content"
+                  / APPID / wid / "project.json")
+            title = json.loads(pj.read_text(encoding="utf-8",
+                                            errors="replace")).get("title", "")
+        except Exception:
+            pass
+
+        rec = {
+            "time": now_iso(),
+            "workshopid": wid,
+            "title": title,
+            "containment": ent["cid"],
+            "signal": sig,
+            "how_identified": ("breadcrumb" if wid in crumbs
+                               else "last-applied" if wid == last
+                               else "journal"),
+            "backtrace": frames,
+            "action": "disabled + error card",
+        }
+        card = make_error_card(wid, title)
+        if not dry_run:
+            append_crashlog(rec)
+            bl = read_blocklist()
+            bl[wid] = {"reason": "crashed plasmashell (%s)" % (sig or "unknown"),
+                       "time": rec["time"], "title": title}
+            write_blocklist(bl)
+            note_disabled(wid)
+            if card:
+                src.switch_to_error_card(ent["cid"], card)
+            # clear the breadcrumb so a future clean load is not misread
+            try:
+                (LOADING_DIR / wid).unlink()
+            except OSError:
+                pass
+        actions.append({"wid": wid, "cid": ent["cid"], "card": card, "record": rec})
+
+    if not dry_run and actions:
+        src.save()
+
+    return {"suspects": suspects, "engines": engines, "actions": actions,
+            "used_fallback": used_fallback}
+
+
+def restart_plasmashell():
+    subprocess.run(["systemctl", "--user", "reset-failed", "plasma-plasmashell"],
+                   check=False)
+    subprocess.run(["systemctl", "--user", "start", "plasma-plasmashell"],
+                   check=False)
+
+
+def plasmashell_state():
+    try:
+        return subprocess.run(["systemctl", "--user", "is-active", "plasma-plasmashell"],
+                              capture_output=True, text=True, timeout=10).stdout.strip()
+    except Exception:
+        return "unknown"
+
+
+def cmd_watch(interval=5):
+    """Poll for plasmashell having crash-looped into a failed state and recover.
+    Self-contained: watches state, never modifies KDE's own units. Only acts on
+    'failed' (a crash), never on a clean 'inactive' stop, so intentional stops
+    are left alone."""
+    ensure_dirs()
+    handled = False
+    while True:
+        state = plasmashell_state()
+        if state == "failed":
+            if not handled:
+                handled = True
+                try:
+                    res = recover(APPLETSRC, dry_run=False)
+                    for a in res["actions"]:
+                        print("crashguard: disabled scene %s on containment %s"
+                              % (a["wid"], a["cid"]), flush=True)
+                    restart_plasmashell()
+                except Exception as e:
+                    print("crashguard: recovery error: %s" % e, flush=True)
+        else:
+            handled = False
+        time.sleep(interval)
+
+
+def cmd_status():
+    print("Blocklist:", json.dumps(read_blocklist(), indent=2))
+    print("\nRecent crashes:")
+    if CRASHLOG.is_file():
+        for ln in CRASHLOG.read_text(encoding="utf-8").splitlines()[-10:]:
+            print("  " + ln)
+    else:
+        print("  (none)")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", metavar="DIR",
+                    help="operate on a copy of the config in DIR; change nothing live")
+    ap.add_argument("--status", action="store_true")
+    ap.add_argument("--watch", action="store_true",
+                    help="run forever, recovering whenever plasmashell fails")
+    ap.add_argument("--no-restart", action="store_true",
+                    help="recover but do not restart plasmashell")
+    args = ap.parse_args()
+
+    if args.status:
+        cmd_status()
+        return
+
+    if args.watch:
+        cmd_watch()
+        return
+
+    if args.dry_run:
+        appletsrc = Path(args.dry_run) / APPLETSRC.name
+        res = recover(appletsrc, dry_run=True)
+        print(json.dumps(res, indent=2))
+        return
+
+    res = recover(APPLETSRC, dry_run=False)
+    for a in res["actions"]:
+        print("disabled crashing scene %s on containment %s"
+              % (a["wid"], a["cid"]))
+    if not args.no_restart:
+        restart_plasmashell()
+
+
+if __name__ == "__main__":
+    main()
