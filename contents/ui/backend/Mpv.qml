@@ -75,6 +75,11 @@ Item{
             player.pause();
         }
     }
+    // player (the Mpv type) fills the parent and is the actual
+    // rendering surface, same as Scene.qml's SceneViewer - was an empty
+    // stub, so mouse-input toggling silently did nothing for video
+    // wallpapers using this backend.
     function getMouseTarget() {
+        return Qt.binding(function() { return player; })
     }
 }

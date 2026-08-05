@@ -782,11 +782,28 @@ RowLayout {
                         return true;
                     }
                     function save_changes() {
+                        // The live wallpaper (main.qml) only re-reads a
+                        // wallpaper's per-option config file when it sees
+                        // cfg_PerOptChanged change - it does not poll the file.
+                        // That toggle used to happen synchronously in
+                        // set_config()/reset_config(), the INSTANT a slider
+                        // moved, while the actual disk write below only
+                        // happens after this function's 300ms debounce
+                        // (perOptSave). The live wallpaper therefore always
+                        // reloaded the file before the new value had been
+                        // written to it, read back the OLD value, and nothing
+                        // ever appeared to change - the reported "sliders
+                        // don't do anything" bug, and it hit every control in
+                        // this panel (Speed/Fps/Display/Mouse Input/Offsets/
+                        // Filters all go through set_config). Fix: only
+                        // toggle cfg_PerOptChanged after every write (and
+                        // reset) below has actually completed.
+                        const pending = [];
                         config_resets.forEach((wid) => {
-                            pyext.reset_wallpaper_config(wid).then(res => {});
+                            pending.push(pyext.reset_wallpaper_config(wid));
                         });
                         Object.entries(config_changes).forEach(([wid, cfg]) => {
-                            pyext.write_wallpaper_config(wid, cfg).then(res => {
+                            pending.push(pyext.write_wallpaper_config(wid, cfg).then(res => {
                                 // Was `this.cofnig.update(...)` - a typo on a
                                 // property that does not exist, so this threw
                                 // inside the promise and the pending changes
@@ -794,10 +811,14 @@ RowLayout {
                                 if(wid === right_opts.workshopid)
                                     right_opts.config = Object.assign({}, right_opts.config, cfg);
                                 right_opts.config_changes = {};
-                            });
+                            }));
                         });
 
                         config_resets.clear();
+
+                        Promise.all(pending).then(() => {
+                            cfg_PerOptChanged = cfg_PerOptChanged + 1;
+                        }).catch(reason => console.error("save_changes failed: " + reason));
                     }
 
                     function set_config(key, val) {
@@ -808,14 +829,12 @@ RowLayout {
                         config_changes[workshopid][key] = val;
 
                         this.config_changesChanged();
-                        cfg_PerOptChanged = !cfg_PerOptChanged;
                         perOptSave.restart();
                     }
                     function reset_config() {
                         config_resets.add(workshopid);
                         delete config_changes[workshopid];
                         config = {}
-                        cfg_PerOptChanged = !cfg_PerOptChanged;
                         perOptSave.restart();
                     }
                     function in_config_changes(key) {

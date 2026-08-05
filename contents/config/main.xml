@@ -108,9 +108,18 @@
       <label>FilterStr</label>
       <default></default>
     </entry>
-    <entry name="PerOptChanged" type="Bool">
+    <entry name="PerOptChanged" type="Int">
+      <!-- Not meaningful state - a pure change-pulse the live wallpaper
+           watches to know when to re-read a wallpaper's per-option config
+           file (see WallpaperPage.qml save_changes(), main.qml
+           onPerOptChangedChanged). Was Bool/toggled; a boolean flipped an
+           even number of times between two Apply-dirty checks nets back to
+           its original value, so Plasma's own dirty-tracking (and the
+           Apply button's enabled state) could miss real pending changes.
+           A monotonically incrementing counter can never net to "unchanged"
+           this way. -->
       <label>PerOptChanged</label>
-      <default>false</default>
+      <default>0</default>
     </entry>
     <entry name="CustomConf" type="String">
       <label>CustomConf</label>

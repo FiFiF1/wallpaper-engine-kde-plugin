@@ -62,6 +62,12 @@ Item{
             player.pause();
         }
     }
+    // player is a MediaPlayer (a non-visual control object with no
+    // geometry) - videoView (the VideoOutput item, anchors.fill: parent)
+    // is the actual rendering surface. Was an empty stub, so mouse-input
+    // toggling silently did nothing for video wallpapers using this
+    // backend.
     function getMouseTarget() {
+        return Qt.binding(function() { return videoView; })
     }
 }

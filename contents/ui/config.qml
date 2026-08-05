@@ -50,7 +50,7 @@ ColumnLayout {
     property int    cfg_PauseMode
     property int    cfg_VideoBackend
 
-    property bool   cfg_PerOptChanged
+    property int    cfg_PerOptChanged
 
     //property alias  cfg_UseMpv
     //property string cfg_BackgroundColor: "black"
@@ -229,7 +229,20 @@ ColumnLayout {
             PauseFilterByScreen: cfg_PauseFilterByScreen,
             PauseOnBatPower:     cfg_PauseOnBatPower,
             PauseBatPercent:     cfg_PauseBatPercent,
-            CustomConf:          cfg_CustomConf
+            CustomConf:          cfg_CustomConf,
+            // Not a shared "setting" like the rest of this list - a
+            // per-wallpaper, per-containment change-pulse (see main.xml's
+            // entry comment). Included here anyway because this is the ONLY
+            // mechanism in this file that pushes a cfg_ value into the live
+            // containment's actual config and reloads it without the user
+            // clicking Apply/OK - standard Plasma cfg_ properties only commit
+            // on Apply/OK (see this function's header comment). Mirroring the
+            // bump to every screen is harmless: main.qml's
+            // onPerOptChangedChanged always re-reads using THAT containment's
+            // own current workshopid, so an unrelated screen just re-reads
+            // unchanged data; two screens showing the same wallpaper both
+            // correctly pick up the edit.
+            PerOptChanged:       cfg_PerOptChanged
         };
     }
 
@@ -302,6 +315,7 @@ ColumnLayout {
     onCfg_PauseOnBatPowerChanged:     shareSettings()
     onCfg_PauseBatPercentChanged:     shareSettings()
     onCfg_CustomConfChanged:          shareSettings()
+    onCfg_PerOptChangedChanged:       shareSettings()
 
     Connections {
         target: wpListModel

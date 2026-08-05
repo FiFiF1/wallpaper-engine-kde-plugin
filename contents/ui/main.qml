@@ -74,7 +74,7 @@ Rectangle {
     readonly property bool picFiltered: picBrightness !== 0 || picContrast !== 0
                                      || picSaturation !== 0 || picBlur > 0
 
-    property bool   perOptChanged: wallpaper.configuration.PerOptChanged
+    property int    perOptChanged: wallpaper.configuration.PerOptChanged
     onPerOptChangedChanged: {
         pyext.read_wallpaper_config(workshopid).then((res) => this.curOpt = res);
     }
