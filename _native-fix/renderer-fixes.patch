@@ -450,13 +450,29 @@ index ccefef4..677d980 100644
  
  } // namespace wallpaper
 diff --git a/src/SpecTexs.hpp b/src/SpecTexs.hpp
-index 3edbd82..3a52907 100644
+index 3edbd82..212711c 100644
 --- a/src/SpecTexs.hpp
 +++ b/src/SpecTexs.hpp
-@@ -61,6 +61,8 @@ constexpr std::string_view G_ETVP { "g_EffectTextureProjectionMatrix" };
+@@ -26,6 +26,13 @@ constexpr std::string_view WE_HALF_COMPO_BUFFER_PREFIX { "_rt_HalfCompoBuffer" }
+ constexpr std::string_view WE_QUARTER_COMPO_BUFFER_PREFIX { "_rt_QuarterCompoBuffer" };
+ constexpr std::string_view WE_FULL_COMPO_BUFFER_PREFIX { "_rt_FullCompoBuffer" };
+ constexpr std::string_view WE_MIP_MAPPED_FRAME_BUFFER { "_rt_MipMappedFrameBuffer" };
++// Shadow atlas: packed depth maps for shadow-casting lights (LIGHTS_SHADOW_MAPPING).
++constexpr std::string_view WE_SHADOW_ATLAS { "_rt_shadowAtlas" };
++// "_alias_" names are engine-provided textures, not files on disk. The only one
++// scenes reference is the light cookie (LIGHTS_COOKIE), which modulates a
++// light's shape; white means "no cookie", i.e. the light is unmodulated.
++constexpr std::string_view WE_ALIAS_PREFIX { "_alias_" };
++constexpr std::string_view WE_UTIL_WHITE { "util/white" };
+ 
+ constexpr std::string_view WE_EFFECT_PPONG_PREFIX { "_rt_effect_pingpong_" };
+ constexpr std::string_view WE_EFFECT_PPONG_PREFIX_A { "_rt_effect_pingpong_a_" };
+@@ -61,6 +68,10 @@ constexpr std::string_view G_ETVP { "g_EffectTextureProjectionMatrix" };
  constexpr std::string_view G_ETVPI { "g_EffectTextureProjectionMatrixInverse" };
  constexpr std::string_view G_LP { "g_LightsPosition" };
  constexpr std::string_view G_LCP { "g_LightsColorPremultiplied" };
++constexpr std::string_view G_LCR { "g_LightsColorRadius" };
++constexpr std::string_view G_LSKY { "g_LightSkylightColor" };
 +constexpr std::string_view G_AS16L { "g_AudioSpectrum16Left" };
 +constexpr std::string_view G_AS16R { "g_AudioSpectrum16Right" };
  
@@ -835,6 +851,60 @@ index 9fb7776..8ccfcdc 100644
          // LOG_INFO("used ram: %fm", (m_device->GetUsage()/1024.0f)/1024.0f);
  
  #if ENABLE_RENDERDOC_API
+diff --git a/src/WPSceneParser.cpp b/src/WPSceneParser.cpp
+index 487c9f9..d155ed6 100644
+--- a/src/WPSceneParser.cpp
++++ b/src/WPSceneParser.cpp
+@@ -217,6 +217,13 @@ BlendMode ParseBlendMode(std::string_view str) {
+ 
+ void ParseSpecTexName(std::string& name, const wpscene::WPMaterial& wpmat,
+                       const WPShaderInfo& sinfo) {
++    // Engine-provided aliases are not files. A light with no cookie assigned
++    // must sample as white so it is left unmodulated; resolving to the real
++    // util/white asset keeps it on the normal texture path.
++    if (sstart_with(name, WE_ALIAS_PREFIX)) {
++        name = std::string(WE_UTIL_WHITE);
++        return;
++    }
+     if (IsSpecTex(name)) {
+         if (name == "_rt_FullFrameBuffer") {
+             name = SpecTex_Default;
+@@ -240,6 +247,8 @@ void ParseSpecTexName(std::string& name, const wpscene::WPMaterial& wpmat,
+         } else if (sstart_with(name, WE_HALF_COMPO_BUFFER_PREFIX)) {
+         } else if (sstart_with(name, WE_QUARTER_COMPO_BUFFER_PREFIX)) {
+         } else if (sstart_with(name, WE_FULL_COMPO_BUFFER_PREFIX)) {
++        } else if (name == WE_SHADOW_ATLAS) {
++            // Resolved from the scene's render targets, created on demand.
+         } else {
+             LOG_ERROR("unknown tex \"%s\"", name.c_str());
+         }
+@@ -336,6 +345,16 @@ bool LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
+         if (IsSpecTex(name)) {
+             if (IsSpecLinkTex(name)) {
+                 svData.renderTargets.push_back({ i, name });
++            } else if (name == WE_SHADOW_ATLAS && pScene->renderTargets.count(name) == 0) {
++                // Created lazily: only scenes with LIGHTS_SHADOW_MAPPING sample
++                // it, and an atlas is not cheap. Nothing renders depth into it
++                // yet, so it reads as "unoccluded" and geometry stays fully lit
++                // rather than failing to resolve.
++                pScene->renderTargets[std::string(WE_SHADOW_ATLAS)] = {
++                    .width = 2048, .height = 2048, .withDepth = true
++                };
++                svData.renderTargets.push_back({ i, name });
++                resolution = { 2048, 2048, 2048, 2048 };
+             } else if (pScene->renderTargets.count(name) == 0) {
+                 LOG_ERROR("%s not found in render targes", name.c_str());
+             } else {
+@@ -522,7 +541,8 @@ void InitContext(ParseContext& context, fs::VFS& vfs, wpscene::WPScene& sc) {
+         gb["g_TexelSize"]     = std::array { 1.0f / 1920.0f, 1.0f / 1080.0f };
+         gb["g_TexelSizeHalf"] = std::array { 1.0f / 1920.0f / 2.0f, 1.0f / 1080.0f / 2.0f };
+ 
+-        gb["g_LightAmbientColor"] = sc.general.ambientcolor;
++        gb["g_LightAmbientColor"]  = sc.general.ambientcolor;
++        gb["g_LightSkylightColor"] = sc.general.skylightcolor;
+         gb["g_NormalModelMatrix"] = ShaderValue::fromMatrix(Matrix4f::Identity());
+     }
+ 
 diff --git a/src/WPShaderParser.cpp b/src/WPShaderParser.cpp
 index 7c3eaec..ba4a4f4 100644
 --- a/src/WPShaderParser.cpp
@@ -854,7 +924,7 @@ index 7c3eaec..ba4a4f4 100644
           it != std::sregex_iterator();
           it++) {
 diff --git a/src/WPShaderValueUpdater.cpp b/src/WPShaderValueUpdater.cpp
-index 4a1025e..6149117 100644
+index 4a1025e..e30602a 100644
 --- a/src/WPShaderValueUpdater.cpp
 +++ b/src/WPShaderValueUpdater.cpp
 @@ -6,6 +6,7 @@
@@ -877,10 +947,11 @@ index 4a1025e..6149117 100644
  void WPShaderValueUpdater::FrameBegin() {
      /*
          using namespace std::chrono;
-@@ -72,6 +78,12 @@ void WPShaderValueUpdater::InitUniforms(SceneNode* pNode, const ExistsUniformOp&
+@@ -72,6 +78,13 @@ void WPShaderValueUpdater::InitUniforms(SceneNode* pNode, const ExistsUniformOp&
      info.has_TEXELSIZEHALF    = existsOp(G_TEXELSIZEHALF);
      info.has_SCREEN           = existsOp(G_SCREEN);
      info.has_LP               = existsOp(G_LP);
++    info.has_LCR              = existsOp(G_LCR);
 +    info.has_AS16L            = existsOp(G_AS16L);
 +    info.has_AS16R            = existsOp(G_AS16R);
 +
@@ -890,10 +961,26 @@ index 4a1025e..6149117 100644
  
      std::accumulate(begin(info.texs), end(info.texs), 0, [&existsOp](uint index, auto& value) {
          value.has_resolution = existsOp(WE_GLTEX_RESOLUTION_NAMES[index]);
-@@ -235,6 +247,17 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
+@@ -235,6 +248,33 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
          updateOp(G_LP, lights);
          updateOp(G_LCP, lights_color);
      }
++
++    if (info.has_LCR) {
++        // vec4 per light: rgb = light colour, w = radius (4 light slots).
++        std::array<float, 16> lights_color_radius { 0 };
++        uint                  i = 0;
++        for (auto& l : m_scene->lights) {
++            if (i == 4) break;
++            const auto& color            = l->color();
++            lights_color_radius[i * 4]     = color[0];
++            lights_color_radius[i * 4 + 1] = color[1];
++            lights_color_radius[i * 4 + 2] = color[2];
++            lights_color_radius[i * 4 + 3] = l->radius();
++            i++;
++        }
++        updateOp(G_LCR, lights_color_radius);
++    }
 +
 +    if (info.has_AS16L || info.has_AS16R) {
 +        AudioSpectrum left {}, right {};
@@ -909,7 +996,7 @@ index 4a1025e..6149117 100644
  
  void WPShaderValueUpdater::SetNodeData(void* nodeAddr, const WPShaderValueData& data) {
 diff --git a/src/WPShaderValueUpdater.hpp b/src/WPShaderValueUpdater.hpp
-index 3d5729c..4a7cf80 100644
+index 3d5729c..d2275af 100644
 --- a/src/WPShaderValueUpdater.hpp
 +++ b/src/WPShaderValueUpdater.hpp
 @@ -18,6 +18,7 @@ namespace wallpaper
@@ -920,16 +1007,17 @@ index 3d5729c..4a7cf80 100644
  
  struct WPUniformInfo {
      bool has_MI { false };
-@@ -38,6 +39,8 @@ struct WPUniformInfo {
+@@ -38,6 +39,9 @@ struct WPUniformInfo {
      bool has_TEXELSIZEHALF { false };
      bool has_SCREEN { false };
      bool has_LP { false };
++    bool has_LCR { false };
 +    bool has_AS16L { false };
 +    bool has_AS16R { false };
  
      struct Tex {
          bool has_resolution { false };
-@@ -63,8 +66,8 @@ struct WPCameraParallax {
+@@ -63,8 +67,8 @@ struct WPCameraParallax {
  
  class WPShaderValueUpdater : public IShaderValueUpdater {
  public:
@@ -940,7 +1028,7 @@ index 3d5729c..4a7cf80 100644
  
      void FrameBegin() override;
  
-@@ -80,7 +83,13 @@ public:
+@@ -80,7 +84,13 @@ public:
      void SetScreenSize(i32 w, i32 h) override { m_screen_size = { (float)w, (float)h }; }
  
  private:

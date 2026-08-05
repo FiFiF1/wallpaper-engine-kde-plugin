@@ -64,15 +64,58 @@ Two deliberate properties:
 Analysis is cached (recomputed at most every ~8ms), so every node in every scene
 can call it per frame cheaply.
 
-## 5. Sound-device teardown race (`Audio/miniaudio-wrapper.hpp`)
+## 5. Sound-device teardown ordering (`Audio/miniaudio-wrapper.hpp`)
 
-`Device::UnInit()` released the channels **before** `ma_device_uninit()`, so the
-audio thread could still be inside `NextPcmData` reading a decoder (and the
-scene-owned storage behind it) that had just been freed. It showed up as a
-**SIGBUS in `WPSoundStream::NextPcmData`** when a scene with sound was torn
-down. Fix: uninit the device first — it waits for the in-flight callback — then
-unmount the channels. Six consecutive shutdown cycles produce no coredump where
-the unfixed build crashed.
+`Device::UnInit()` released the channels **before** `ma_device_uninit()`, so in
+principle the audio thread could still be inside `NextPcmData` reading a decoder
+that had just been freed. Reordered to uninit the device first (it waits for the
+in-flight callback), then unmount the channels.
+
+**Honesty note on the evidence.** This started from a `SIGBUS` seen in
+`WPSoundStream::NextPcmData`, which looked like that race. It was not: the real
+cause was installing a new `libWallpaperEngineKde.so` with `cp` **over the file
+while plasmashell had it mmap'd** — overwriting a file-backed mapping in place
+invalidates the running process's pages and raises SIGBUS in whatever function
+happens to execute next. A later crash under the same procedure landed in
+`TextureCache`/`TextureKey::HashValue`, an unrelated function, which is what gave
+it away. So this reordering is **defensive hygiene, not a fix for an observed
+bug** — no known crash is attributable to the old order.
+
+**Install correctly:** stop plasmashell, replace the `.so`, then start it — or
+write alongside and `mv` (an atomic rename swaps the directory entry and leaves
+the old inode intact for the running process). Never `cp` over the live library.
+
+## 6. Lighting: `g_LightsColorRadius`, skylight, shadow atlas, light cookies
+
+Four gaps in the lighting path:
+
+- **`g_LightsColorRadius[4]`** (`vec4` per light: `.rgb` colour, `.w` radius) is
+  read by the model lighting shaders (`generic.frag`, `generic2.frag`) and was
+  fed by nothing. Now filled per frame alongside `g_LightsPosition` /
+  `g_LightsColorPremultiplied`.
+- **`g_LightSkylightColor`** was parsed into the scene (`general.skylightcolor`)
+  but never handed to shaders. Now set next to `g_LightAmbientColor`.
+- **`_alias_lightCookie`** — `_alias_` names are engine-provided textures, not
+  files. The renderer looked it up in the VFS and logged
+  `not found "/assets/materials/_alias_lightCookie.tex"` on every scene load.
+  A light with no cookie must sample as white (unmodulated), so the alias now
+  resolves to the real `util/white` asset and stays on the normal texture path.
+- **`_rt_shadowAtlas`** hit the `unknown tex` / `not found in render targets`
+  error paths. It is now recognised and its render target is created **on
+  demand**, so only scenes that actually enable `LIGHTS_SHADOW_MAPPING` pay the
+  VRAM.
+
+**Scope, stated plainly:** this makes the lighting *inputs* correct and the two
+resources resolve. It is **not** shadow casting — nothing renders depth into the
+atlas, so it reads as unoccluded and lit geometry simply has no shadows. Real
+shadow mapping needs per-light depth passes driven by atlas-transform and
+light-projection values that WE passes as *function arguments*
+(`PerformShadowMapping(projectedCoords, atlasTransform)`); no shader in the
+installed asset set declares a uniform carrying them, so the contract cannot be
+observed from this machine, and inventing one would be guesswork. Of 256
+installed wallpapers, none enable `LIGHTS_SHADOW_MAPPING` or `LIGHTS_COOKIE`.
+
+Result: scene loads are now free of renderer errors.
 
 Not reported upstream (the repo is archived). Local patches.
 
@@ -98,8 +141,12 @@ and `.fixed` = this patched build):
 
 ```sh
 DST=~/.local/lib/wallpaper-engine/qml/com/github/catsout/wallpaperEngineKde
-cp build/src/libWallpaperEngineKde.so "$DST/libWallpaperEngineKde.so"
-systemctl --user stop plasma-plasmashell && systemctl --user start plasma-plasmashell
+# NEVER cp over the live .so: plasmashell has it mmap'd and overwriting it in
+# place invalidates the running process's pages -> SIGBUS. Stage + atomic mv.
+cp build/src/libWallpaperEngineKde.so "$DST/.new.so"
+systemctl --user stop plasma-plasmashell
+mv "$DST/.new.so" "$DST/libWallpaperEngineKde.so"
+systemctl --user start plasma-plasmashell
 ```
 
 Revert: `cp "$DST/libWallpaperEngineKde.so.bak" "$DST/libWallpaperEngineKde.so"`
