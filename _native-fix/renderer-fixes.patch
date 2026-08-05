@@ -1,0 +1,49 @@
+diff --git a/src/WPShaderParser.cpp b/src/WPShaderParser.cpp
+index 7c3eaec..ba4a4f4 100644
+--- a/src/WPShaderParser.cpp
++++ b/src/WPShaderParser.cpp
+@@ -305,7 +305,12 @@ inline std::string Preprocessor(const std::string& in_src, ShaderType type, cons
+                       &res,
+                       includer);
+ 
+-    std::regex re_io(R"(.+\s(in|out)\s[\s\w]+\s(\w+)\s*;)", std::regex::ECMAScript);
++    // NOTE: the char class is [ \t\w] (space/tab/word), NOT [\s\w]. \s also
++    // matches newlines, which let this greedy quantifier span the whole
++    // preprocessed shader and recurse until libstdc++'s std::regex overflowed
++    // the stack (a hard crash on some scenes). GLSL interface declarations are
++    // single-line, so excluding the newline is identical for real shaders.
++    std::regex re_io(R"(.+\s(in|out)\s[ \t\w]+\s(\w+)\s*;)", std::regex::ECMAScript);
+     for (auto it = std::sregex_iterator(res.begin(), res.end(), re_io);
+          it != std::sregex_iterator();
+          it++) {
+diff --git a/src/WPTexImageParser.cpp b/src/WPTexImageParser.cpp
+index ec396e4..a097b23 100644
+--- a/src/WPTexImageParser.cpp
++++ b/src/WPTexImageParser.cpp
+@@ -110,7 +110,16 @@ void LoadHeader(fs::IBinaryStream& file, ImageHeader& header) {
+ 
+     header.count = file.ReadInt32();
+ 
+-    if (header.extraHeader["texb"].val == 3) header.type = static_cast<ImageType>(file.ReadInt32());
++    // Image-container textures store their source format (a FreeImage FIF value,
++    // e.g. PNG=13) right after the image count; TEXB0004 added one further field
++    // after it. The original code only read the format, and only for TEXB0003, so
++    // every TEXB0004 texture misaligned - containers read garbage mipmap sizes and
++    // failed, raw ones read as empty. Read the format for TEXB0003+ and skip the
++    // extra field for TEXB0004+.
++    if (header.extraHeader["texb"].val >= 3) {
++        header.type = static_cast<ImageType>(file.ReadInt32());
++        if (header.extraHeader["texb"].val >= 4) file.ReadInt32();
++    }
+ }
+ 
+ void SetHeaderPow2(ImageHeader& header, i32 mip_0_w, i32 mip_0_h) {
+@@ -185,7 +194,7 @@ std::shared_ptr<Image> WPTexImageParser::Parse(const std::string& name) {
+                 }
+             }
+             // is image container
+-            if (img.header.extraHeader["texb"].val == 3 && img.header.type != ImageType::UNKNOWN) {
++            if (img.header.extraHeader["texb"].val >= 3 && img.header.type != ImageType::UNKNOWN) {
+                 int32_t w, h, n;
+                 auto*   data =
+                     stbi_load_from_memory((const unsigned char*)result, src_size, &w, &h, &n, 4);

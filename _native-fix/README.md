@@ -1,39 +1,39 @@
-# Native renderer fix — shader-preprocessor stack overflow
+# Native renderer fixes
 
-Some Wallpaper Engine **scene** wallpapers hard-crash plasmashell inside the
-native library `libWallpaperEngineKde.so`. Root cause: in
-`catsout/wallpaper-scene-renderer` `src/WPShaderParser.cpp`, function
-`Preprocessor`, the interface-variable regex
+Two patches to `catsout/wallpaper-scene-renderer` (the C++ scene renderer built
+into `libWallpaperEngineKde.so`). Combined diff: `renderer-fixes.patch`.
 
-```cpp
-std::regex re_io(R"(.+\s(in|out)\s[\s\w]+\s(\w+)\s*;)", std::regex::ECMAScript);
-```
+## 1. Shader-preprocessor stack overflow (`WPShaderParser.cpp`)
 
-is run with `sregex_iterator` over the **whole** glslang-preprocessed shader. The
-char class `[\s\w]` includes `\n`, so on a large shader the greedy quantifier
-spans the entire file and libstdc++'s recursive `std::regex` recurses until the
-stack overflows → SIGSEGV/SIGABRT, taking the whole desktop down.
+`Preprocessor`'s interface-variable regex ran over the whole preprocessed shader
+with a char class `[\s\w]` that matches newlines, so on a large shader
+libstdc++'s recursive `std::regex` recursed until the stack overflowed — a hard
+plasmashell crash. Fix: `[\s\w]` → `[ \t\w]` (space/tab/word, not newline).
+Byte-identical extraction on real single-line GLSL; no runaway recursion.
 
-## The fix (`WPShaderParser-io-regex.patch`)
+## 2. `TEXB0004` texture-container parsing (`WPTexImageParser.cpp`)
 
-Change the char class `[\s\w]` → `[ \t\w]` (space/tab/word, **not** newline).
-GLSL interface declarations are single-line, so this is byte-for-byte identical
-extraction on real shaders (verified by comparing the old and new regex output on
-the crashing scene's shaders and on realistic/contrived inputs), while making the
-newline-spanning — and thus the runaway recursion — impossible. One line changed.
+`.tex` files of version `TEXB0004` store two extra header fields after the image
+count — a FreeImage format id (e.g. `PNG=13`, or `-1` for raw) and a flag. The
+parser read one field and only for `TEXB0003`, so every `TEXB0004` texture
+misaligned: image-container textures (PNGs packed in a `.tex`) read garbage
+mipmap sizes and failed to load, raw ones loaded as empty. Symptom: a wallpaper
+whose layers are `TEXB0004` PNG containers rendered as **gray + noise**, and the
+resulting null textures fed a GPU **`VK_ERROR_DEVICE_LOST`**. Fix: read the
+format field for `TEXB0003+`, skip the extra field for `TEXB0004+`, and take the
+FreeImage-decode path for `TEXB0003+` (not just `==3`). This fixed the
+`直到大地变成一颗酸橙` wallpaper (id 3776778760) — it now renders fully.
 
-Reported upstream: no (the repo is archived). This is a local patch.
+Not reported upstream (the repo is archived). Local patches.
 
-## Rebuilding the native library
+## Build / install / revert
 
-The shipped `.so` is a prebuilt COPR RPM (see `~/.local/bin/wallpaper-engine-refresh-libs`),
-so the fix has to be compiled and the `.so` swapped into the user-local bundle.
-Built in the `plasmabuild` fedora-44 toolbox (matches the host Qt6/KF6 ABI):
+Built in the `plasmabuild` fedora-44 toolbox (matches host Qt6 6.11 / KF6 6.28):
 
 ```sh
 git clone --recursive --depth 1 --shallow-submodules \
     https://github.com/catsout/wallpaper-engine-kde-plugin.git we-build
-cd we-build/src/backend_scene && git apply < .../WPShaderParser-io-regex.patch && cd ../..
+cd we-build/src/backend_scene && git apply < .../renderer-fixes.patch && cd ../..
 # in the plasmabuild toolbox:
 sudo dnf install -y extra-cmake-modules kf6-plasma-devel kf6-kpackage-devel \
     qt6-qtdeclarative-devel qt6-qtbase-private-devel lz4-devel vulkan-loader-devel \
@@ -43,21 +43,23 @@ cmake .. -DCMAKE_BUILD_TYPE=Release -DUSE_PLASMAPKG=OFF -DBUILD_QML=ON
 make -j$(nproc)
 ```
 
-Install the result (back up the original first):
+Install (the bundle keeps `libWallpaperEngineKde.so.bak` = original COPR build,
+and `.fixed` = this patched build):
 
 ```sh
 DST=~/.local/lib/wallpaper-engine/qml/com/github/catsout/wallpaperEngineKde
-cp "$DST/libWallpaperEngineKde.so" "$DST/libWallpaperEngineKde.so.bak"
-cp build/bin/.../libWallpaperEngineKde.so "$DST/libWallpaperEngineKde.so"
+cp build/src/libWallpaperEngineKde.so "$DST/libWallpaperEngineKde.so"
 systemctl --user stop plasma-plasmashell && systemctl --user start plasma-plasmashell
 ```
 
-## Revert
+Revert: `cp "$DST/libWallpaperEngineKde.so.bak" "$DST/libWallpaperEngineKde.so"`
+then stop/start plasmashell.
 
-```sh
-cp "$DST/libWallpaperEngineKde.so.bak" "$DST/libWallpaperEngineKde.so"
-systemctl --user stop plasma-plasmashell && systemctl --user start plasma-plasmashell
-```
+**Note:** `wallpaper-engine-refresh-libs` re-fetches the unpatched COPR `.so` and
+overwrites this — rebuild + reinstall after running it.
 
-**Note:** `wallpaper-engine-refresh-libs` re-fetches the COPR `.so` and will
-overwrite this patched build. Re-apply after running it.
+## Known remaining gaps (non-fatal)
+
+The 3776778760 scene still logs, but renders fine without them: a **video
+effect** whose shader won't compile (`'[]' : scalar integer expression`), and
+**shadow-atlas / light-cookie** render targets the renderer doesn't implement.
