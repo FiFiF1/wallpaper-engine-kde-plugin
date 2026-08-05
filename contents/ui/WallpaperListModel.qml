@@ -262,12 +262,21 @@ Item {
     // fully synchronous on the python side - see pyext.py). Cached there, so
     // once a library has been scanned once this settles in a single fast
     // round trip on every later refresh. Mutates folderWorker.model (the
-    // backing array) directly and re-runs the filter/sort pass after each
-    // batch, so items appear/disappear correctly as a resolution filter is
-    // applied to newly-resolved items, and progress is visible incrementally
-    // rather than all at once at the end.
+    // backing array) directly.
+    //
+    // Redisplaying (filterToList, a full clear()+repopulate of the visible
+    // grid) happens exactly ONCE, after every batch has finished - not once
+    // per batch. A 260-item library needs ~33 batches; refreshing the grid on
+    // every single one made the whole dialog visibly flash/flicker on every
+    // open, which is worse than the alternative (resolution-filtered items
+    // popping in a little late on a first, uncached scan).
     property int _resBatchSize: 8
     function fillResolutions() {
+        return root._fillResolutionsBatch().then(() => {
+            return folderWorker.filterToList(root.model, root.filterStr, folderWorker.model);
+        });
+    }
+    function _fillResolutionsBatch() {
         const pending = folderWorker.model.filter(el => el.resTier === "");
         if(pending.length === 0) return Promise.resolve();
 
@@ -280,7 +289,6 @@ Item {
                 const r = res[el.workshopid];
                 el.resTier = r ? r.tier : "Unknown";
             });
-            return folderWorker.filterToList(root.model, root.filterStr, folderWorker.model);
         }).catch(reason => {
             console.error("fillResolutions batch failed: " + reason);
             // Mark this batch resolved anyway (as Unknown) so a persistent
@@ -289,7 +297,7 @@ Item {
             batch.forEach(el => { if(el.resTier === "") el.resTier = "Unknown"; });
         }).then(() => {
             if(pending.length > root._resBatchSize)
-                return root.fillResolutions();
+                return root._fillResolutionsBatch();
             return Promise.resolve();
         });
     }
