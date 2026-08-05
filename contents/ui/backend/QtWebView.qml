@@ -38,10 +38,24 @@ Item {
             if(!webobj.generalProperties)
                 webobj.generalProperties = {fps: 24};
             webobj.sigGeneralProperties(webobj.generalProperties);
-            readfile(Common.urlNative(background.getWorkshopIDPath()) + "/project.json", function(text) { 
+            // readfile() returns a Promise (see Pyext.qml) -- it does not take a
+            // callback. Calling it as readfile(path, cb) silently discards both
+            // the returned Promise and the never-invoked cb, so user properties
+            // (e.g. this wallpaper's own introanimation/modelresolution/etc.)
+            // never reached the page. That left every web wallpaper stuck
+            // without its properties -- some (like this one) depend on a
+            // property just to start rendering at all, so they stayed black.
+            const _pjPath = Common.urlNative(background.getWorkshopIDPath()) + "/project.json";
+            readfile(_pjPath).then((text) => {
                 const json = Utils.parseJson(text);
+                if (!json || !json.general || !json.general.properties) {
+                    console.error("wpe: project.json missing general.properties at " + _pjPath);
+                    return;
+                }
                 webobj.userProperties = json.general.properties;
                 webobj.sigUserProperties(webobj.userProperties);
+            }).catch((e) => {
+                console.error("wpe: failed to read/parse project.json at " + _pjPath + ": " + e);
             });
         }
     }
@@ -99,13 +113,41 @@ Item {
             }
         }
 
+        // qwebchannel.js is normally a Qt resource, but not every Qt build
+        // exposes it under that qrc path (Fedora's Qt6 ships it only as a plain
+        // file under /usr/share). When it is missing the injection silently does
+        // nothing, QWebChannel stays undefined, and every web wallpaper loses
+        // its user properties.
+        //
+        // WebEngine resolves sourceUrl itself, so instead of probing for the
+        // file (QML's XMLHttpRequest refuses these reads) we register the known
+        // locations. Whichever resolves defines QWebChannel; the others load
+        // nothing, and a redefinition is harmless.
+        //
+        // Assign to userScripts.collection rather than calling insert(): in Qt6
+        // webEngineScript is a structured value type, and only property
+        // assignment converts these plain JS objects into it. insert() silently
+        // accepted them and injected nothing, which is why web wallpapers lost
+        // their properties entirely.
         Component.onCompleted: {
-            userScripts.insert([
+            userScripts.collection = [
                 {
                     injectionPoint: WebEngineScript.DocumentCreation,
                     worldId: WebEngineScript.MainWorld,
-                    name: "QWebChannel",
+                    name: "QWebChannelQrc",
                     sourceUrl: "qrc:///qtwebchannel/qwebchannel.js"
+                },
+                {
+                    injectionPoint: WebEngineScript.DocumentCreation,
+                    worldId: WebEngineScript.MainWorld,
+                    name: "QWebChannelQt6",
+                    sourceUrl: "file:///usr/share/qt6/webchannel/qwebchannel.js"
+                },
+                {
+                    injectionPoint: WebEngineScript.DocumentCreation,
+                    worldId: WebEngineScript.MainWorld,
+                    name: "QWebChannelQt5",
+                    sourceUrl: "file:///usr/share/qt5/qtwebchannel/qwebchannel.js"
                 },
                 {
                     injectionPoint: WebEngineScript.DocumentCreation,
@@ -142,7 +184,7 @@ Item {
                         document.getElementsByTagName('body')[0].ondragstart = function() { return false; }
                         `
                 }
-            ])
+            ];
             background.nowBackend = 'QtWebEngine';
         }
 
