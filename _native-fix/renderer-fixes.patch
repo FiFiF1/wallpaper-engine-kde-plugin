@@ -385,6 +385,25 @@ index 0000000..d675849
 +};
 +
 +} // namespace wallpaper
+diff --git a/src/Audio/miniaudio-wrapper.hpp b/src/Audio/miniaudio-wrapper.hpp
+index 69bca22..0e17594 100644
+--- a/src/Audio/miniaudio-wrapper.hpp
++++ b/src/Audio/miniaudio-wrapper.hpp
+@@ -140,8 +140,13 @@ public:
+         if (IsInited()) {
+             LOG_INFO("uninit sound device");
+         }
+-        UnmountAll();
++        // Stop and join the device thread BEFORE releasing the channels.
++        // ma_device_uninit() waits for any in-flight audio callback to finish;
++        // dropping the channels first frees the decoders (and the scene-owned
++        // storage they read from) while that thread may still be inside
++        // NextPcmData -- observed as a SIGBUS there when a scene is torn down.
+         ma_device_uninit(&m_device); // always do it
++        UnmountAll();
+     }
+     // bool IsStarted() const { return ma_device_is_started(&m_device); }
+     // bool IsStopped() const { return ma_device_get_state(&m_device) == MA_STATE_STOPPED; }
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
 index 8dd28c9..6234323 100644
 --- a/src/CMakeLists.txt

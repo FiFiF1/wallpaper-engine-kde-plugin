@@ -64,6 +64,16 @@ Two deliberate properties:
 Analysis is cached (recomputed at most every ~8ms), so every node in every scene
 can call it per frame cheaply.
 
+## 5. Sound-device teardown race (`Audio/miniaudio-wrapper.hpp`)
+
+`Device::UnInit()` released the channels **before** `ma_device_uninit()`, so the
+audio thread could still be inside `NextPcmData` reading a decoder (and the
+scene-owned storage behind it) that had just been freed. It showed up as a
+**SIGBUS in `WPSoundStream::NextPcmData`** when a scene with sound was torn
+down. Fix: uninit the device first — it waits for the in-flight callback — then
+unmount the channels. Six consecutive shutdown cycles produce no coredump where
+the unfixed build crashed.
+
 Not reported upstream (the repo is archived). Local patches.
 
 ## Build / install / revert
