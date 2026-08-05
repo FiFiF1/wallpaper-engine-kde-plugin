@@ -206,8 +206,44 @@ then stop/start plasmashell.
 **Note:** `wallpaper-engine-refresh-libs` re-fetches the unpatched COPR `.so` and
 overwrites this — rebuild + reinstall after running it.
 
+## 8. Effect-owned render targets logged as "unknown tex" (`WPSceneParser.cpp`)
+
+Effects (Bloom, depth-of-field/"Bokeh blur", Cutout Vignette, and the
+"compose" image option) declare their own render targets with an
+author-chosen label plus a runtime-unique suffix —
+`_rt_<label>_<pointer-address>`, e.g. `_rt_coc_140567771445120` or
+`_rt_buffer1_<addr>` (`getAddr()`/`rtname`, same file). There is no fixed
+vocabulary of labels to whitelist: by the time `ParseSpecTexName` ran, that
+effect-fbo parsing had *already* registered the name into
+`pScene->renderTargets` with correct dimensions (`WPSceneParser.cpp:779-848`),
+but `ParseSpecTexName`'s dispatch was a hardcoded prefix whitelist with no
+branch for these, so every one hit the catch-all `LOG_ERROR("unknown tex
+...")` — pure false-positive noise on every load of a scene using such an
+effect. The caller a few lines below already does its own accurate
+`pScene->renderTargets.count(name)` check and logs correctly for anything
+genuinely missing, so the fix is simply to stop logging in `ParseSpecTexName`
+for names it doesn't specifically recognize — that check already exists and
+is authoritative. Confirmed live on 2942400953 (Satori Komeiji): the
+`unknown tex "_rt_coc_..."` / `_rt_downscaled1_...` / `_rt_downscaled2_...`
+and `not found in render targets` lines are gone entirely; the wallpaper's
+own rendering was unaffected either way (it never depended on this log line).
+
+**This is a logging fix, not a rendering fix — verified separately.** Testing
+this surfaced a genuinely different, deeper issue that had been masked by the
+same noise: "Bloom" and "Cutout Vignette" on that scene still fail to load,
+but now for an actual GLSL compile error (`ERROR: 0:200: '' : compilation
+terminated`), unrelated to render-target naming. Left as-is — the wallpaper
+still renders correctly without those two effects, and root-causing a
+specific shader's compile failure is a separate, unscoped investigation.
+
+Not reported upstream (the repo is archived). Local patches.
+
 ## Known remaining gaps (non-fatal)
 
-The 3776778760 scene still logs, but renders fine without them: a **video
-effect** whose shader won't compile (`'[]' : scalar integer expression`), and
-**shadow-atlas / light-cookie** render targets the renderer doesn't implement.
+- The 3776778760 scene still logs, but renders fine without them: a **video
+  effect** whose shader won't compile (`'[]' : scalar integer expression`).
+- The 2942400953 scene's **Bloom** and **Cutout Vignette** effects fail to
+  load from an actual shader compile error (see fix 8) — renders fine without
+  them.
+- **Real shadow casting** is still not implemented (fix 6 only makes the
+  shadow-atlas *resource* resolve; nothing renders depth into it).
