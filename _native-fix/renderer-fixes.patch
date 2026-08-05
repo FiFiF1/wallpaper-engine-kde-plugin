@@ -1,3 +1,390 @@
+diff --git a/src/Audio/AudioCapture.cpp b/src/Audio/AudioCapture.cpp
+new file mode 100644
+index 0000000..a2b5fda
+--- /dev/null
++++ b/src/Audio/AudioCapture.cpp
+@@ -0,0 +1,300 @@
++#include "Audio/AudioCapture.hpp"
++#include "Utils/Logging.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <cstring>
++#include <mutex>
++#include <vector>
++
++// Header-only include. The miniaudio implementation is compiled exactly once,
++// in SoundManager.cpp via miniaudio-wrapper.hpp; these MA_NO_* defines must stay
++// identical to that translation unit's or the ma_* struct layouts would differ.
++#define MA_NO_WASAPI
++#define MA_NO_DSOUND
++#define MA_NO_WINMM
++#define MA_NO_COREAUDIO
++#define MA_NO_ENCODING
++#include <miniaudio/miniaudio.h>
++
++namespace wallpaper
++{
++
++namespace
++{
++constexpr std::size_t FFT_SIZE  = 1024;             // ~21ms at 48kHz
++constexpr std::size_t FFT_BINS  = FFT_SIZE / 2;
++constexpr ma_uint32   RATE      = 48000;
++constexpr auto        MIN_PERIOD = std::chrono::milliseconds(8);
++
++// Band edges in Hz, 16 log-spaced bands over the musically useful range.
++constexpr float BAND_EDGES[AUDIO_BANDS + 1] = { 30,   60,   95,   140,  200,  280,
++                                                400,  550,  760,  1050, 1450, 2000,
++                                                2800, 4000, 6000, 9000, 16000 };
++
++// In-place iterative radix-2 FFT. `re`/`im` are FFT_SIZE long.
++void fft(float* re, float* im) {
++    // bit-reversal permutation
++    for (std::size_t i = 1, j = 0; i < FFT_SIZE; i++) {
++        std::size_t bit = FFT_SIZE >> 1;
++        for (; j & bit; bit >>= 1) j ^= bit;
++        j ^= bit;
++        if (i < j) {
++            std::swap(re[i], re[j]);
++            std::swap(im[i], im[j]);
++        }
++    }
++    for (std::size_t len = 2; len <= FFT_SIZE; len <<= 1) {
++        const double ang  = -2.0 * M_PI / (double)len;
++        const float  wr_d = (float)std::cos(ang);
++        const float  wi_d = (float)std::sin(ang);
++        for (std::size_t i = 0; i < FFT_SIZE; i += len) {
++            float wr = 1.0f, wi = 0.0f;
++            for (std::size_t k = 0; k < len / 2; k++) {
++                const float ur = re[i + k], ui = im[i + k];
++                const float vr = re[i + k + len / 2] * wr - im[i + k + len / 2] * wi;
++                const float vi = re[i + k + len / 2] * wi + im[i + k + len / 2] * wr;
++                re[i + k]               = ur + vr;
++                im[i + k]               = ui + vi;
++                re[i + k + len / 2]     = ur - vr;
++                im[i + k + len / 2]     = ui - vi;
++                const float nwr         = wr * wr_d - wi * wi_d;
++                wi                      = wr * wi_d + wi * wr_d;
++                wr                      = nwr;
++            }
++        }
++    }
++}
++} // namespace
++
++struct AudioCapture::Impl {
++    // Separate locks by role. `life_mtx` guards refcount + device lifetime;
++    // `mtx` guards only the sample ring and is taken by the realtime audio
++    // callback, so it must never be held while starting/stopping the device.
++    std::mutex life_mtx;
++    std::mutex mtx;                       // guards the sample ring
++    ma_context ctx {};
++    ma_device  dev {};
++    bool       ctx_ok { false };
++    bool       dev_ok { false };
++    bool       running { false };
++    int        refs { 0 };
++    bool       tried { false };           // only attempt device setup once per start
++
++    // Ring of interleaved stereo samples, most recent FFT_SIZE frames.
++    std::array<float, FFT_SIZE> ring_l {};
++    std::array<float, FFT_SIZE> ring_r {};
++    std::size_t                 wpos { 0 };
++    bool                        got_audio { false };
++
++    // Cached analysis output.
++    std::mutex                            out_mtx;
++    AudioSpectrum                         out_l {};
++    AudioSpectrum                         out_r {};
++    std::chrono::steady_clock::time_point last_analysis {};
++    bool                                  have_analysis { false };
++
++    // Windowing table (Hann), precomputed.
++    std::array<float, FFT_SIZE> window {};
++
++    Impl() {
++        for (std::size_t i = 0; i < FFT_SIZE; i++)
++            window[i] = 0.5f * (1.0f - std::cos(2.0f * (float)M_PI * (float)i / (FFT_SIZE - 1)));
++    }
++
++    static void data_cb(ma_device* dev, void*, const void* in, ma_uint32 frames) {
++        auto* self = static_cast<Impl*>(dev->pUserData);
++        if (self == nullptr || in == nullptr) return;
++        const float* f = static_cast<const float*>(in);
++        std::lock_guard<std::mutex> lk(self->mtx);
++        for (ma_uint32 i = 0; i < frames; i++) {
++            self->ring_l[self->wpos] = f[i * 2 + 0];
++            self->ring_r[self->wpos] = f[i * 2 + 1];
++            self->wpos               = (self->wpos + 1) % FFT_SIZE;
++        }
++        if (frames > 0) self->got_audio = true;
++    }
++
++    // Open the monitor source of the DEFAULT SINK. Picking merely the first
++    // ".monitor" device grabs whichever output happens to be enumerated first
++    // (often an idle HDMI port) and captures nothing but silence.
++    bool start() {
++        if (running) return true;
++        if (tried && ! dev_ok) return false;
++        tried = true;
++
++        if (! ctx_ok) {
++            ma_backend backends[] = { ma_backend_pulseaudio, ma_backend_alsa };
++            if (ma_context_init(backends, 2, nullptr, &ctx) != MA_SUCCESS) {
++                LOG_ERROR("audio: context init failed; audio-reactive scenes will see silence");
++                return false;
++            }
++            ctx_ok = true;
++        }
++
++        ma_device_info* play = nullptr;
++        ma_device_info* cap  = nullptr;
++        ma_uint32       nplay = 0, ncap = 0;
++        if (ma_context_get_devices(&ctx, &play, &nplay, &cap, &ncap) != MA_SUCCESS) {
++            LOG_ERROR("audio: device enumeration failed");
++            return false;
++        }
++
++        char want[300];
++        want[0] = '\0';
++        for (ma_uint32 i = 0; i < nplay; i++) {
++            if (play[i].isDefault) {
++                std::snprintf(want, sizeof want, "%s.monitor", play[i].id.pulse);
++                break;
++            }
++        }
++
++        int pick = -1, first_mon = -1;
++        for (ma_uint32 i = 0; i < ncap; i++) {
++            const bool is_mon = std::strstr(cap[i].id.pulse, ".monitor") != nullptr;
++            if (is_mon && first_mon < 0) first_mon = (int)i;
++            if (want[0] != '\0' && std::strcmp(cap[i].id.pulse, want) == 0) pick = (int)i;
++        }
++        if (pick < 0) pick = first_mon;
++        if (pick < 0) {
++            LOG_ERROR("audio: no monitor source found; audio-reactive scenes will see silence");
++            return false;
++        }
++
++        ma_device_config cfg  = ma_device_config_init(ma_device_type_capture);
++        cfg.capture.pDeviceID = &cap[pick].id;
++        cfg.capture.format    = ma_format_f32;
++        cfg.capture.channels  = 2;
++        cfg.sampleRate        = RATE;
++        cfg.dataCallback      = &Impl::data_cb;
++        cfg.pUserData         = this;
++
++        if (ma_device_init(&ctx, &cfg, &dev) != MA_SUCCESS) {
++            LOG_ERROR("audio: capture device init failed");
++            return false;
++        }
++        dev_ok = true;
++        if (ma_device_start(&dev) != MA_SUCCESS) {
++            LOG_ERROR("audio: capture device start failed");
++            ma_device_uninit(&dev);
++            dev_ok = false;
++            return false;
++        }
++        running = true;
++        LOG_INFO("audio: capturing system output from \"%s\"", cap[pick].name);
++        return true;
++    }
++
++    void stop() {
++        if (dev_ok) {
++            ma_device_uninit(&dev);
++            dev_ok = false;
++        }
++        running = false;
++        tried   = false;
++        {
++            std::lock_guard<std::mutex> lk(mtx);
++            got_audio = false;
++            ring_l.fill(0.0f);
++            ring_r.fill(0.0f);
++            wpos = 0;
++        }
++        std::lock_guard<std::mutex> lk(out_mtx);
++        out_l.fill(0.0f);
++        out_r.fill(0.0f);
++        have_analysis = false;
++    }
++
++    void analyse_channel(const std::array<float, FFT_SIZE>& src, std::size_t start,
++                         AudioSpectrum& prev) {
++        static thread_local std::vector<float> re, im;
++        re.assign(FFT_SIZE, 0.0f);
++        im.assign(FFT_SIZE, 0.0f);
++        for (std::size_t i = 0; i < FFT_SIZE; i++)
++            re[i] = src[(start + i) % FFT_SIZE] * window[i];
++        fft(re.data(), im.data());
++
++        const float bin_hz = (float)RATE / (float)FFT_SIZE;
++        for (std::size_t b = 0; b < AUDIO_BANDS; b++) {
++            const auto k0 = (std::size_t)std::max(1.0f, BAND_EDGES[b] / bin_hz);
++            auto       k1 = (std::size_t)(BAND_EDGES[b + 1] / bin_hz);
++            k1            = std::min(k1, FFT_BINS - 1);
++            float peak    = 0.0f;
++            for (std::size_t k = k0; k <= k1 && k < FFT_BINS; k++) {
++                const float mag = std::sqrt(re[k] * re[k] + im[k] * im[k]) * (2.0f / FFT_SIZE);
++                peak            = std::max(peak, mag);
++            }
++            // Magnitude -> dB -> 0..1, matching the rough feel of WE's meters.
++            const float db = 20.0f * std::log10(peak + 1e-7f);
++            float       v  = (db + 62.0f) / 62.0f;
++            v              = std::clamp(v, 0.0f, 1.0f);
++            // Fast attack, slower release, so bars pop on transients but decay
++            // smoothly instead of flickering.
++            prev[b] = v > prev[b] ? v : prev[b] + (v - prev[b]) * 0.28f;
++        }
++    }
++
++    void analyse() {
++        std::array<float, FFT_SIZE> l, r;
++        std::size_t                 start;
++        {
++            std::lock_guard<std::mutex> lk(mtx);
++            if (! got_audio) return;
++            l     = ring_l;
++            r     = ring_r;
++            start = wpos; // oldest sample
++        }
++        std::lock_guard<std::mutex> lk(out_mtx);
++        analyse_channel(l, start, out_l);
++        analyse_channel(r, start, out_r);
++        have_analysis = true;
++    }
++};
++
++AudioCapture::AudioCapture(): m_impl(std::make_unique<Impl>()) {}
++AudioCapture::~AudioCapture() {
++    if (m_impl) {
++        m_impl->stop();
++        if (m_impl->ctx_ok) ma_context_uninit(&m_impl->ctx);
++    }
++}
++
++AudioCapture& AudioCapture::Instance() {
++    static AudioCapture inst;
++    return inst;
++}
++
++void AudioCapture::Acquire() {
++    std::lock_guard<std::mutex> lk(m_impl->life_mtx);
++    if (m_impl->refs++ == 0) m_impl->start();
++}
++
++void AudioCapture::Release() {
++    std::lock_guard<std::mutex> lk(m_impl->life_mtx);
++    if (m_impl->refs > 0 && --m_impl->refs == 0) m_impl->stop();
++}
++
++bool AudioCapture::active() const { return m_impl->running && m_impl->got_audio; }
++
++void AudioCapture::GetSpectrum(AudioSpectrum& left, AudioSpectrum& right) {
++    if (! m_impl->running) {
++        left.fill(0.0f);
++        right.fill(0.0f);
++        return;
++    }
++    const auto now = std::chrono::steady_clock::now();
++    bool       due = false;
++    {
++        std::lock_guard<std::mutex> lk(m_impl->out_mtx);
++        due = ! m_impl->have_analysis || (now - m_impl->last_analysis) >= MIN_PERIOD;
++        if (due) m_impl->last_analysis = now;
++    }
++    if (due) m_impl->analyse();
++
++    std::lock_guard<std::mutex> lk(m_impl->out_mtx);
++    left  = m_impl->out_l;
++    right = m_impl->out_r;
++}
++
++} // namespace wallpaper
+diff --git a/src/Audio/CMakeLists.txt b/src/Audio/CMakeLists.txt
+index c36fd68..5ad2932 100644
+--- a/src/Audio/CMakeLists.txt
++++ b/src/Audio/CMakeLists.txt
+@@ -3,6 +3,7 @@ set(LIB_NAME wpAudio)
+ add_library(${LIB_NAME}
+     STATIC
+     SoundManager.cpp
++    AudioCapture.cpp
+ )
+ 
+ target_link_libraries(${LIB_NAME}
+diff --git a/src/Audio/include/Audio/AudioCapture.hpp b/src/Audio/include/Audio/AudioCapture.hpp
+new file mode 100644
+index 0000000..d675849
+--- /dev/null
++++ b/src/Audio/include/Audio/AudioCapture.hpp
+@@ -0,0 +1,63 @@
++#pragma once
++// System-audio capture + spectrum analysis for audio-reactive scenes.
++//
++// Wallpaper Engine scenes that declare the AUDIOPROCESSING combo sample two
++// uniforms, `g_AudioSpectrum16Left[16]` and `g_AudioSpectrum16Right[16]`.
++// This captures whatever is playing on the default output (the PulseAudio /
++// PipeWire ".monitor" source of the default sink) and reduces it to those two
++// 16-band spectra.
++//
++// One capture device is shared process-wide: plasmashell runs a separate scene
++// per monitor, and opening one input device per scene would show up as several
++// recording streams and waste CPU. Scenes Acquire()/Release() a reference and
++// the device is only open while at least one audio-reactive scene is live.
++#include <array>
++#include <cstdint>
++#include <memory>
++
++namespace wallpaper
++{
++
++inline constexpr std::size_t AUDIO_BANDS = 16;
++using AudioSpectrum                      = std::array<float, AUDIO_BANDS>;
++
++class AudioCapture {
++public:
++    // Process-wide instance. Never null; safe to use even if capture fails
++    // (it then reports silence forever).
++    static AudioCapture& Instance();
++
++    // Ref-counted device lifetime. Acquire() starts capture on the first
++    // reference; Release() stops it when the last one goes away.
++    void Acquire();
++    void Release();
++
++    // Latest 16-band spectra, each roughly 0..1. Cheap to call many times per
++    // frame: the analysis is computed at most once per ~8ms and cached, so
++    // every node in every scene can call it freely. Returns silence when
++    // capture is unavailable.
++    void GetSpectrum(AudioSpectrum& left, AudioSpectrum& right);
++
++    // True once a capture device is actually open and delivering samples.
++    bool active() const;
++
++    AudioCapture(const AudioCapture&)            = delete;
++    AudioCapture& operator=(const AudioCapture&) = delete;
++
++private:
++    AudioCapture();
++    ~AudioCapture();
++    struct Impl;
++    std::unique_ptr<Impl> m_impl;
++};
++
++// RAII helper: hold one of these for as long as a scene needs audio.
++class AudioCaptureRef {
++public:
++    AudioCaptureRef() { AudioCapture::Instance().Acquire(); }
++    ~AudioCaptureRef() { AudioCapture::Instance().Release(); }
++    AudioCaptureRef(const AudioCaptureRef&)            = delete;
++    AudioCaptureRef& operator=(const AudioCaptureRef&) = delete;
++};
++
++} // namespace wallpaper
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
 index 8dd28c9..6234323 100644
 --- a/src/CMakeLists.txt
@@ -43,6 +430,19 @@ index ccefef4..677d980 100644
  };
  
  } // namespace wallpaper
+diff --git a/src/SpecTexs.hpp b/src/SpecTexs.hpp
+index 3edbd82..3a52907 100644
+--- a/src/SpecTexs.hpp
++++ b/src/SpecTexs.hpp
+@@ -61,6 +61,8 @@ constexpr std::string_view G_ETVP { "g_EffectTextureProjectionMatrix" };
+ constexpr std::string_view G_ETVPI { "g_EffectTextureProjectionMatrixInverse" };
+ constexpr std::string_view G_LP { "g_LightsPosition" };
+ constexpr std::string_view G_LCP { "g_LightsColorPremultiplied" };
++constexpr std::string_view G_AS16L { "g_AudioSpectrum16Left" };
++constexpr std::string_view G_AS16R { "g_AudioSpectrum16Right" };
+ 
+ constexpr std::string_view G_TIME { "g_Time" };
+ constexpr std::string_view G_DAYTIME { "g_DayTime" };
 diff --git a/src/VideoTex.cpp b/src/VideoTex.cpp
 new file mode 100644
 index 0000000..97e752b
@@ -434,6 +834,107 @@ index 7c3eaec..ba4a4f4 100644
      for (auto it = std::sregex_iterator(res.begin(), res.end(), re_io);
           it != std::sregex_iterator();
           it++) {
+diff --git a/src/WPShaderValueUpdater.cpp b/src/WPShaderValueUpdater.cpp
+index 4a1025e..6149117 100644
+--- a/src/WPShaderValueUpdater.cpp
++++ b/src/WPShaderValueUpdater.cpp
+@@ -6,6 +6,7 @@
+ #include "SpecTexs.hpp"
+ #include "Core/ArrayHelper.hpp"
+ #include "Utils/Algorism.h"
++#include "Audio/AudioCapture.hpp"
+ 
+ #include <Eigen/Dense>
+ #include <Eigen/Geometry>
+@@ -17,6 +18,11 @@
+ using namespace wallpaper;
+ using namespace Eigen;
+ 
++// Defined here (not inline) because m_audio_ref holds a forward-declared type,
++// whose deleter must see the complete type.
++WPShaderValueUpdater::WPShaderValueUpdater(Scene* scene): m_scene(scene) {}
++WPShaderValueUpdater::~WPShaderValueUpdater() = default;
++
+ void WPShaderValueUpdater::FrameBegin() {
+     /*
+         using namespace std::chrono;
+@@ -72,6 +78,12 @@ void WPShaderValueUpdater::InitUniforms(SceneNode* pNode, const ExistsUniformOp&
+     info.has_TEXELSIZEHALF    = existsOp(G_TEXELSIZEHALF);
+     info.has_SCREEN           = existsOp(G_SCREEN);
+     info.has_LP               = existsOp(G_LP);
++    info.has_AS16L            = existsOp(G_AS16L);
++    info.has_AS16R            = existsOp(G_AS16R);
++
++    // A scene only captures system audio if some shader actually samples the
++    // spectrum; the device stays closed for every other wallpaper.
++    if (info.has_AS16L || info.has_AS16R) RequestAudio();
+ 
+     std::accumulate(begin(info.texs), end(info.texs), 0, [&existsOp](uint index, auto& value) {
+         value.has_resolution = existsOp(WE_GLTEX_RESOLUTION_NAMES[index]);
+@@ -235,6 +247,17 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
+         updateOp(G_LP, lights);
+         updateOp(G_LCP, lights_color);
+     }
++
++    if (info.has_AS16L || info.has_AS16R) {
++        AudioSpectrum left {}, right {};
++        AudioCapture::Instance().GetSpectrum(left, right);
++        if (info.has_AS16L) updateOp(G_AS16L, std::span<const float> { left.data(), left.size() });
++        if (info.has_AS16R) updateOp(G_AS16R, std::span<const float> { right.data(), right.size() });
++    }
++}
++
++void WPShaderValueUpdater::RequestAudio() {
++    if (! m_audio_ref) m_audio_ref = std::make_unique<AudioCaptureRef>();
+ }
+ 
+ void WPShaderValueUpdater::SetNodeData(void* nodeAddr, const WPShaderValueData& data) {
+diff --git a/src/WPShaderValueUpdater.hpp b/src/WPShaderValueUpdater.hpp
+index 3d5729c..4a7cf80 100644
+--- a/src/WPShaderValueUpdater.hpp
++++ b/src/WPShaderValueUpdater.hpp
+@@ -18,6 +18,7 @@ namespace wallpaper
+ {
+ 
+ class Scene;
++class AudioCaptureRef;
+ 
+ struct WPUniformInfo {
+     bool has_MI { false };
+@@ -38,6 +39,8 @@ struct WPUniformInfo {
+     bool has_TEXELSIZEHALF { false };
+     bool has_SCREEN { false };
+     bool has_LP { false };
++    bool has_AS16L { false };
++    bool has_AS16R { false };
+ 
+     struct Tex {
+         bool has_resolution { false };
+@@ -63,8 +66,8 @@ struct WPCameraParallax {
+ 
+ class WPShaderValueUpdater : public IShaderValueUpdater {
+ public:
+-    WPShaderValueUpdater(Scene* scene): m_scene(scene) {}
+-    virtual ~WPShaderValueUpdater() {}
++    WPShaderValueUpdater(Scene* scene);
++    virtual ~WPShaderValueUpdater();
+ 
+     void FrameBegin() override;
+ 
+@@ -80,7 +83,13 @@ public:
+     void SetScreenSize(i32 w, i32 h) override { m_screen_size = { (float)w, (float)h }; }
+ 
+ private:
++    // Opens the shared system-audio capture the first time a shader in this
++    // scene is found to sample the spectrum; the reference keeps it open for
++    // this scene's lifetime.
++    void RequestAudio();
++
+     Scene*               m_scene;
++    std::unique_ptr<AudioCaptureRef> m_audio_ref;
+     WPCameraParallax     m_parallax;
+     double               m_dayTime { 0.0f };
+     std::array<float, 2> m_texelSize { 1.0f / 1920.0f, 1.0f / 1080.0f };
 diff --git a/src/WPTexImageParser.cpp b/src/WPTexImageParser.cpp
 index ec396e4..5088150 100644
 --- a/src/WPTexImageParser.cpp

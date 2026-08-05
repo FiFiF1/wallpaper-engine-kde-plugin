@@ -40,6 +40,30 @@ Cost note: 4K60 layers are software-decoded on CPU (~1.2 cores for a 4K60 clip) 
 re-uploaded per frame with a full-device `WaitIdle`; a transfer-queue + fence path
 and display-size decode would cut that, left as future work.
 
+## 4. Audio-reactive scenes (`Audio/AudioCapture.*`, `WPShaderValueUpdater.*`)
+
+Wallpaper Engine scenes that enable the `AUDIOPROCESSING` combo sample two
+uniforms, `g_AudioSpectrum16Left[16]` / `g_AudioSpectrum16Right[16]`. The
+renderer fed neither (no capture, no analysis, not even a zero stub), so those
+wallpapers stayed frozen. Added `AudioCapture`: it opens the PulseAudio /
+PipeWire **monitor source of the default sink** — matching `"<sink>.monitor"`,
+because grabbing merely the first `.monitor` device lands on an idle HDMI port
+and captures silence — and reduces it to two 16-band spectra with a radix-2 FFT
+(1024-pt, Hann window, log-spaced bands 30Hz-16kHz, dB-mapped to 0..1 with
+fast-attack / slow-release smoothing). `WPShaderValueUpdater` detects the
+uniforms via `existsOp` and feeds them each frame.
+
+Two deliberate properties:
+- **Lazy and shared.** The device opens only when a scene actually samples the
+  spectrum, and one capture is shared process-wide (plasmashell runs a scene per
+  monitor; one device per scene would mean several recording streams). It is
+  released when the last audio-reactive scene goes away.
+- **Never fatal.** No audio server, no monitor source, or a failed device all
+  degrade to reporting silence rather than failing the wallpaper.
+
+Analysis is cached (recomputed at most every ~8ms), so every node in every scene
+can call it per frame cheaply.
+
 Not reported upstream (the repo is archived). Local patches.
 
 ## Build / install / revert
