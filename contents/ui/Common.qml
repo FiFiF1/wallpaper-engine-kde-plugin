@@ -43,7 +43,12 @@ QtObject {
         contentrating: "Everyone",
         tags: [],
         favor: false,
-        playlists: []
+        playlists: [],
+        // "" means "not resolved yet" (distinct from "Unknown" - a wallpaper
+        // type, like web, that genuinely has no single native resolution).
+        // Filled in asynchronously in batches by WallpaperListModel after the
+        // initial scan; see resolve_resolutions in pyext.py.
+        resTier: ""
     })
 
     function wpitemFromQtObject(qobj) {
@@ -90,6 +95,13 @@ QtObject {
         ListElement { text: "Television";   type:"tags";          key:"Television";    def: 1}
         ListElement { text: "Vehicle";      type:"tags";          key:"Vehicle";       def: 1}
         ListElement { text: "Unspecified";  type:"tags";          key:"Unspecified";   def: 1}
+        ListElement { text: "RESOLUTION";   type:"_nocheck";      key:"";              def: 1}
+        ListElement { text: "8K";           type:"resolution";    key:"8K";            def: 1}
+        ListElement { text: "4K";           type:"resolution";    key:"4K";            def: 1}
+        ListElement { text: "1440p";        type:"resolution";    key:"1440p";         def: 1}
+        ListElement { text: "1080p";        type:"resolution";    key:"1080p";         def: 1}
+        ListElement { text: "SD";           type:"resolution";    key:"SD";            def: 1}
+        ListElement { text: "Unknown";      type:"resolution";    key:"Unknown";       def: 1}
         ListElement { text: "PLAYLIST";     type:"_nocheck";      key:"";              def: 1}
 
         // need to be able to lock the filterModel because when settings are being applied to multiple screens simultaneously,
@@ -144,6 +156,8 @@ QtObject {
                     typeF[el.key] = el.value;
                 else if(el.type === "contentrating")
                     typeF[el.key] = el.value;
+                else if(el.type === "resolution")
+                    typeF["res_" + el.key] = el.value;
                 else if(el.type === "favor") 
                     onlyFavor = el.value;
                 else if(el.type === "tags") {
@@ -158,6 +172,9 @@ QtObject {
 
             const checkType = (el) => Boolean(typeF[el.type]);
             const checkContentrating = (el) => Boolean(typeF[el.contentrating]);
+            // resTier "" means "not resolved yet" - never filtered out while
+            // pending, so newly-scanned items do not flicker out of view.
+            const checkResolution = (el) => !el.resTier || Boolean(typeF["res_" + el.resTier]);
             const checkFavor = (el) => onlyFavor?el.favor:true;
             const checkNoTags = (el) => {
                 for(let i=0;i < el.tags.length;i++) {
@@ -177,7 +194,7 @@ QtObject {
                 return false;
             }
             return (el) => {
-                return checkType(el) && checkFavor(el) && checkContentrating(el) && checkNoTags(el) && checkPlaylists(el);
+                return checkType(el) && checkFavor(el) && checkContentrating(el) && checkResolution(el) && checkNoTags(el) && checkPlaylists(el);
             }
         }
     }

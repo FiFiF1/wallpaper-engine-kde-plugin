@@ -31,10 +31,21 @@ RowLayout {
     property var selectedTags: []
 
     readonly property var sortModel: [
-        { text: "Popular this week", value: "trend" },
+        { text: "Popular",         value: "trend" },
         { text: "Most recent",       value: "mostrecent" },
         { text: "Top rated",         value: "toprated" },
         { text: "Most subscribed",   value: "totaluniquesubscribers" }
+    ]
+
+    // Only meaningful for the "Popular" sort - Steam windows trending by a day
+    // count there; other sorts are not time-windowed the same way. Values
+    // confirmed live against steamcommunity.com/workshop/browse (see pyext.py).
+    property int trendDays: 7
+    readonly property var trendDaysModel: [
+        { text: "Today",      value: 1 },
+        { text: "This week",  value: 7 },
+        { text: "This month", value: 30 },
+        { text: "This year",  value: 365 }
     ]
 
     ListModel { id: wsModel }
@@ -47,7 +58,8 @@ RowLayout {
         workshopPage.busy = true;
         workshopPage.errorText = "";
         pyext.workshop_browse(workshopPage.sortMode, workshopPage.page,
-                              workshopPage.query, workshopPage.selectedTags)
+                              workshopPage.query, workshopPage.selectedTags,
+                              workshopPage.trendDays)
             .then((res) => {
                 workshopPage.busy = false;
                 workshopPage.loadedOnce = true;
@@ -424,6 +436,16 @@ RowLayout {
                 currentIndex: Math.max(0, Common.modelIndexOfValue(workshopPage.sortModel, workshopPage.sortMode))
                 onActivated: (i) => {
                     workshopPage.sortMode = workshopPage.sortModel[i].value;
+                    workshopPage.reload();
+                }
+            }
+            ComboBox {
+                visible: workshopPage.sortMode === "trend"
+                textRole: "text"
+                model: workshopPage.trendDaysModel
+                currentIndex: Math.max(0, Common.modelIndexOfValue(workshopPage.trendDaysModel, workshopPage.trendDays))
+                onActivated: (i) => {
+                    workshopPage.trendDays = workshopPage.trendDaysModel[i].value;
                     workshopPage.reload();
                 }
             }

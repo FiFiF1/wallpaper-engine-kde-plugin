@@ -116,17 +116,17 @@ class Main:
     # because answering it means reading files.
     __AUDIO_EXT = (".mp3", ".ogg", ".wav", ".flac", ".m4a", ".aac", ".opus")
 
-    def __pkg_entry_names(self, pkg: Path) -> list:
-        """File names inside a Wallpaper Engine .pkg, from its header alone.
+    def __pkg_header(self, pkg: Path) -> "tuple[list, int]":
+        """Parse a Wallpaper Engine .pkg header: (entries, payload_base_offset).
 
         Every version seen in the wild (PKGV0001 through PKGV0024) uses the same
         header: a length-prefixed version string, an entry count, then per entry
-        a length-prefixed name plus offset and length. Only the names are read -
-        the payload is never touched, so this stays cheap on a 200 MB scene.
+        a length-prefixed name plus offset and length (both relative to the byte
+        right after the header). Shared by every .pkg reader below so the format
+        is parsed in exactly one place.
         """
         import struct
 
-        names: list = []
         with pkg.open("rb") as f:
             head = f.read(1 << 20)
         off = 0
@@ -150,11 +150,34 @@ class Main:
         count = take_int()
         if count < 0 or count > 100000:
             raise ValueError("bad entry count in pkg header")
+        entries: list = []
         for _ in range(count):
-            names.append(take_str())
-            take_int()                  # offset
-            take_int()                  # length
-        return names
+            name = take_str()
+            entry_off = take_int()
+            entry_len = take_int()
+            entries.append((name, entry_off, entry_len))
+        return entries, off
+
+    def __pkg_entry_names(self, pkg: Path) -> list:
+        """File names inside a .pkg. The payload is never touched, so this
+        stays cheap even on a 200 MB scene."""
+        entries, _base = self.__pkg_header(pkg)
+        return [name for name, _o, _l in entries]
+
+    def __pkg_read_entry(self, pkg: Path, name: str, max_len: int = 8 << 20) -> Optional[bytes]:
+        """Read one entry's payload out of a .pkg by name, or None if absent.
+        Bounded to max_len (default 8MB - scene.json is a few KB to low hundreds
+        of KB in practice) so a corrupt length can't force a huge read."""
+        entries, base = self.__pkg_header(pkg)
+        for name_i, entry_off, entry_len in entries:
+            if name_i != name:
+                continue
+            if entry_len < 0 or entry_len > max_len:
+                return None
+            with pkg.open("rb") as f:
+                f.seek(base + entry_off)
+                return f.read(entry_len)
+        return None
 
     def __dir_has_audio(self, root: Path, max_entries: int = 4000) -> bool:
         seen = 0
@@ -241,6 +264,145 @@ class Main:
             caps["sound"] = False
 
         return caps
+
+    # ------------------------------------------------------------ resolution
+    # Resolution is not a field Wallpaper Engine puts in project.json for any
+    # wallpaper type, so it has to be derived per type and is worth caching:
+    # video goes through ffprobe (~200ms/item) and scene through a .pkg
+    # payload read, so scanning the whole library live on every settings-page
+    # open would be slow. QML calls this in small batches (see
+    # WallpaperListModel.qml) and results are cached to disk keyed by folder
+    # mtime, so repeat scans of an unchanged library are instant.
+
+    __RES_TIERS = (
+        (7000, "8K"), (3800, "4K"), (2500, "1440p"), (1800, "1080p"), (1, "SD"),
+    )
+
+    def __resolution_tier(self, w: int, h: int) -> str:
+        if not w or not h:
+            return "Unknown"
+        long_edge = max(w, h)
+        for threshold, tier in self.__RES_TIERS:
+            if long_edge >= threshold:
+                return tier
+        return "Unknown"
+
+    def __resolution_cache_path(self) -> Path:
+        d = Path.home() / ".local" / "share" / "wekde"
+        d.mkdir(parents=True, exist_ok=True)
+        return d / "resolution-cache.json"
+
+    def __load_resolution_cache(self) -> dict:
+        try:
+            return json.loads(self.__resolution_cache_path().read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def __save_resolution_cache(self, cache: dict) -> None:
+        try:
+            self.__resolution_cache_path().write_text(
+                json.dumps(cache), encoding="utf-8")
+        except Exception:
+            pass                         # best-effort; a lost cache just means a rescan
+
+    def __probe_video_resolution(self, target: Path) -> "tuple[int, int]":
+        try:
+            out = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height", "-of", "csv=p=0",
+                 str(target)],
+                capture_output=True, text=True, timeout=20)
+            parts = out.stdout.strip().split(",")
+            if len(parts) == 2:
+                return int(parts[0]), int(parts[1])
+        except Exception:
+            pass
+        return 0, 0
+
+    def __probe_scene_resolution(self, folder: Path) -> "tuple[int, int]":
+        # A scene's own scene.json declares the canvas it was authored at
+        # (general.orthogonalprojection) - the closest thing to a "native
+        # resolution" a scene has, since there is no single output texture.
+        raw: Optional[bytes] = None
+        pkg = folder / "scene.pkg"
+        if pkg.is_file():
+            try:
+                raw = self.__pkg_read_entry(pkg, "scene.json")
+            except Exception:
+                raw = None
+        else:
+            unpacked = folder / "scene.json"
+            if unpacked.is_file():
+                try:
+                    raw = unpacked.read_bytes()
+                except Exception:
+                    raw = None
+        if raw is None:
+            return 0, 0
+        try:
+            scene = json.loads(raw.decode("utf-8", "replace"))
+            op = ((scene.get("general") or {}).get("orthogonalprojection") or {})
+            return int(op.get("width") or 0), int(op.get("height") or 0)
+        except Exception:
+            return 0, 0
+
+    def resolve_resolutions(self, items: list) -> dict:
+        """items: [{"workshopid", "path" (folder, file:// or native), "type"}].
+        Returns {workshopid: {"tier": str, "w": int, "h": int}} for exactly the
+        items passed in. `type: "web"` items are answered "Unknown" without
+        touching disk - a web wallpaper has no single native resolution."""
+        cache = self.__load_resolution_cache()
+        result: dict = {}
+        dirty = False
+
+        for item in items or []:
+            wid = str(item.get("workshopid") or "")
+            raw_path = str(item.get("path") or "")
+            wtype = str(item.get("type") or "").lower()
+            if not wid or not raw_path:
+                continue
+
+            folder = Path(raw_path)
+            if folder.is_file():
+                folder = folder.parent
+
+            if wtype == "web":
+                result[wid] = {"tier": "Unknown", "w": 0, "h": 0}
+                continue
+
+            try:
+                mtime = folder.stat().st_mtime
+            except Exception:
+                mtime = 0
+
+            cache_key = str(folder)
+            cached = cache.get(cache_key)
+            if cached and cached.get("mtime") == mtime:
+                result[wid] = {"tier": cached["tier"], "w": cached["w"], "h": cached["h"]}
+                continue
+
+            w, h = 0, 0
+            try:
+                if wtype == "video":
+                    project = json.loads(
+                        (folder / "project.json").read_text(encoding="utf-8", errors="replace"))
+                    wfile = str(project.get("file", ""))
+                    target = folder / wfile
+                    if target.is_file():
+                        w, h = self.__probe_video_resolution(target)
+                elif wtype == "scene":
+                    w, h = self.__probe_scene_resolution(folder)
+            except Exception:
+                w, h = 0, 0
+
+            tier = self.__resolution_tier(w, h)
+            cache[cache_key] = {"mtime": mtime, "tier": tier, "w": w, "h": h}
+            dirty = True
+            result[wid] = {"tier": tier, "w": w, "h": h}
+
+        if dirty:
+            self.__save_resolution_cache(cache)
+        return result
 
     # ---------------------------------------------------------------- steam
     # Subscribing is an account change, so it has to be an authenticated request
@@ -603,7 +765,7 @@ class Main:
         }
 
     def workshop_browse(self, sort: str = "trend", page: int = 1,
-                        query: str = "", tags: list = None) -> dict:
+                        query: str = "", tags: list = None, days: int = 0) -> dict:
         """List Steam Workshop items for Wallpaper Engine.
 
         Deliberately parsed structurally - by the /filedetails/?id= link and the
@@ -634,6 +796,21 @@ class Main:
         }
         if query:
             params["searchtext"] = query
+        # Steam's own workshop UI windows "trend" sort by a day count (its
+        # newer client-side state calls this trend_days, but that key is inert
+        # on the page this scrapes - "days" on the classic query string is the
+        # one that actually changes the server-rendered results, confirmed live:
+        # 1/7/30/90/180/365 each return a distinct, progressively wider set;
+        # 0 or omitted defaults to Steam's own default (7, "this week"); nothing
+        # past 365 narrows or widens further, so there is no working "all time"
+        # value via this endpoint).
+        allowed_days = (1, 7, 30, 90, 180, 365)
+        try:
+            days = int(days)
+        except Exception:
+            days = 0
+        if sort == "trend" and days in allowed_days:
+            params["days"] = str(days)
 
         # Steam ANDs requiredtags together, so these are include-filters: the
         # local library's filters hide things, these narrow the search.
@@ -830,6 +1007,7 @@ jrpc.add_method(M.reset_wallpaper_config)
 jrpc.add_method(M.workshop_browse)
 jrpc.add_method(M.workshop_item)
 jrpc.add_method(M.wallpaper_caps)
+jrpc.add_method(M.resolve_resolutions)
 jrpc.add_method(M.path_exists)
 jrpc.add_method(M.record_last_applied)
 jrpc.add_method(M.read_favorites)

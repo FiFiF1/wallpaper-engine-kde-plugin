@@ -246,11 +246,51 @@ Item {
                     return this.loadFolderLists(values);
                 }).then(() => {
                     resolve();
+                    // Fire-and-forget: don't make refresh() wait on a
+                    // potentially multi-second first-time resolution scan.
+                    root.fillResolutions();
                 }).catch(reason => {
                     console.error(reason)
                     resolve();
                 });
             });
+        });
+    }
+
+    // Fills in resTier for whatever items don't have one yet, in small
+    // batches so a single call never blocks the RPC bridge for long (it is
+    // fully synchronous on the python side - see pyext.py). Cached there, so
+    // once a library has been scanned once this settles in a single fast
+    // round trip on every later refresh. Mutates folderWorker.model (the
+    // backing array) directly and re-runs the filter/sort pass after each
+    // batch, so items appear/disappear correctly as a resolution filter is
+    // applied to newly-resolved items, and progress is visible incrementally
+    // rather than all at once at the end.
+    property int _resBatchSize: 8
+    function fillResolutions() {
+        const pending = folderWorker.model.filter(el => el.resTier === "");
+        if(pending.length === 0) return Promise.resolve();
+
+        const batch = pending.slice(0, root._resBatchSize);
+        const items = batch.map(el => (
+            { workshopid: el.workshopid, path: Common.urlNative(el.path), type: el.type }
+        ));
+        return pyext.resolve_resolutions(items).then(res => {
+            batch.forEach(el => {
+                const r = res[el.workshopid];
+                el.resTier = r ? r.tier : "Unknown";
+            });
+            return folderWorker.filterToList(root.model, root.filterStr, folderWorker.model);
+        }).catch(reason => {
+            console.error("fillResolutions batch failed: " + reason);
+            // Mark this batch resolved anyway (as Unknown) so a persistent
+            // error - no ffprobe installed, say - can't turn into an infinite
+            // retry loop; the next refresh() will simply try again.
+            batch.forEach(el => { if(el.resTier === "") el.resTier = "Unknown"; });
+        }).then(() => {
+            if(pending.length > root._resBatchSize)
+                return root.fillResolutions();
+            return Promise.resolve();
         });
     }
 

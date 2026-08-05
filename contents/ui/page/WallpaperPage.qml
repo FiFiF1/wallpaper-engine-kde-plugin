@@ -171,6 +171,18 @@ RowLayout {
                     view.delegate: KCM.GridDelegate {
                         // path is file://, safe to concat with '/'
                         text: title
+                        // tags is a nested list model once inside the outer
+                        // ListModel (not a plain JS array), so it needs .get();
+                        // subtitle already elides to one line, so no length cap
+                        // is needed here.
+                        subtitle: {
+                            const t = model.tags;
+                            if (!t || !t.count) return "";
+                            const names = [];
+                            for (let i = 0; i < t.count; i++)
+                                names.push(t.get(i).key);
+                            return names.join(", ");
+                        }
                         hoverEnabled: true
                         actions: [
                             Kirigami.Action {

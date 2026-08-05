@@ -59,9 +59,9 @@ Item {
     }
     // Public Steam Workshop listing for the Workshop tab. Read-only browsing:
     // subscribing still happens in Steam itself.
-    function workshop_browse(sort, page, query, tags) {
+    function workshop_browse(sort, page, query, tags, days) {
         return ws_server.jrpc.send("workshop_browse",
-            [sort || "trend", page || 1, query || "", tags || []]).then(res => res.result);
+            [sort || "trend", page || 1, query || "", tags || [], days || 0]).then(res => res.result);
     }
     function path_exists(path) {
         return ws_server.jrpc.send("path_exists", [String(path)]).then(res => res.result);
@@ -78,6 +78,12 @@ Item {
     // sound at all - so the settings page can drop controls it would ignore.
     function wallpaper_caps(path) {
         return ws_server.jrpc.send("wallpaper_caps", [String(path)]).then(res => res.result);
+    }
+    // Resolution tier per item, batched: [{workshopid, path, type}, ...] ->
+    // {workshopid: {tier, w, h}}. Cached on the python side, so repeat calls
+    // for an unchanged library return immediately.
+    function resolve_resolutions(items) {
+        return ws_server.jrpc.send("resolve_resolutions", [items]).then(res => res.result);
     }
     // Subscribe / unsubscribe directly, reusing the Steam client's own cached
     // login so no browser opens. The helper reports failure as a flag rather
