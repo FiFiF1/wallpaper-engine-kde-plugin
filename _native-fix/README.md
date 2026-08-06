@@ -238,6 +238,111 @@ specific shader's compile failure is a separate, unscoped investigation.
 
 Not reported upstream (the repo is archived). Local patches.
 
+## 9. Failed-effect layer dropped entirely, rendering as a solid black rect (`VulkanRender/SceneToRenderGraph.cpp`)
+
+Fix 8 stopped `ParseSpecTexName` from logging false-positive noise for a
+layer whose *every* declared effect fails to compile - but the underlying
+render-graph behaviour for that case was never actually fixed, and it is
+worse than "missing an effect": the base layer's own (perfectly valid)
+material never reaches the screen at all.
+
+**Why.** A layer with `HasImgEffect()` always redirects its base material's
+render straight into the effect chain's first ping-pong buffer
+(`ToGraphPass`, `output = imgeff->FirstTarget()`), *before* any effect is
+compiled. Normally, resolving the effect chain (`SceneImageEffectLayer::
+ResolveEffect`) renames the *last successful* effect's own output to the
+real destination, relaying the whole chain (including the base material) to
+the screen. With zero successful effects, `m_effects` is empty, that rename
+never happens, and the base material's already-rendered content is simply
+never composited anywhere - the region reads back as the render target's
+clear value, i.e. solid black. Confirmed live on 3605722997 ("Simple Audio
+Bars", a `float % int` GLSL error Wallpaper Engine's own compiler tolerates
+but glslang correctly rejects) - a large black rectangle, not merely a
+missing bar-graph overlay.
+
+**First attempt was itself a crash bug.** The obvious fix - add a copy pass
+relaying the ping-pong buffer straight to the real destination when
+`EffectCount() == 0` - reproducibly took the whole GPU context down with
+`VK_ERROR_DEVICE_LOST` (confirmed 3/3 across separate live plasmashell
+deploys, each self-recovering only because the library was reverted and
+plasmashell restarted). Root-caused via Vulkan validation layers (see
+tooling section below): `CopyPass` (`CopyPass.cpp`) always issues
+`vkCmdCopyImage` sized to the **source's full extent**, with **no scaling**.
+A ping-pong buffer is sized to the effect layer's own declared canvas
+(`WPSceneParser.cpp`'s `scene.renderTargets[effect_ppong_a] =
+{wpimgobj.size...}`), which does not generally match the actual output
+resolution - confirmed via the isolated test harness: a 2560x1440 source
+copied into a 1280x720 destination, an out-of-bounds copy region
+(`VUID-vkCmdCopyImage-dstOffset-00150`) that the driver turned into a hung
+GPU context instead of a clean validation-only failure.
+
+**Actual fix: guard the copy on matching size.** Only relay through when the
+ping-pong buffer and the destination are recorded at the exact same
+width/height (`scene.renderTargets`, compared before adding the pass) - true
+for genuinely fullscreen effect layers (`wpimgobj.fullscreen`, whose
+ping-pong buffer is dynamically bound to the real output size via
+`.bind.screen = true`), false otherwise. When sizes don't match, falls back
+to the prior (silent-drop) behaviour rather than attempting a copy that can
+corrupt/hang the GPU. A fully general fix - scaling *any* mismatched layer
+through correctly - would need a real sample-based blit pass (shader-based,
+not `vkCmdCopyImage`), which does not exist in this renderer yet; out of
+scope here given the size-matched case already covers this bug's actual
+reported symptom. Verified live end-to-end on 3605722997: black rectangle is
+gone, replaced by the base layer's actual (audio-bars-effect-free) content;
+zero `VK_ERROR_*` in the log across the deploy, no coredump.
+
+### Diagnostic tooling built for this (reusable)
+
+Getting a *safe*, GPU-crash-proof repro - i.e. one that can't take the live
+desktop down while iterating - took real setup, worth recording:
+
+- **`standalone_view/` builds a real, tiny standalone test binary**
+  (`sceneviewer`, GLFW+raw Vulkan, no Qt/plasmashell needed at all) that
+  links the exact same `wescene-renderer` static lib the plugin does. Not
+  wired into the main build (`add_subdirectory` in the outer
+  `CMakeLists.txt` doesn't reach it) - configure and build it as its own
+  tree: `cmake ../src/backend_scene/standalone_view -DBUILD_QML=OFF && cmake
+  --build .` (needs `glfw-devel`, already-vendored `argparse` header). Run:
+  `sceneviewer --valid-layer <assets-dir> <scene.json>` - `--valid-layer`
+  requests `VK_LAYER_KHRONOS_validation` directly, no plasmashell/live-desktop
+  involvement, so a crash only takes down this one disposable process.
+- **The generic Qt `qml` CLI runner is NOT a viable substitute** - tried
+  first, hit two dead ends: (1) it doesn't correctly negotiate the GL
+  extension (`EXT_memory_object`) this renderer's Vulkan-GL interop needs,
+  so scenes silently never load; (2) `source`/`assets` are `QUrl` C++
+  properties (`SceneBackend.hpp`) - a bare path string assigned from QML
+  does NOT coerce to a valid local-file QUrl (silently resolves to nothing);
+  needs an explicit `file://` prefix.
+- **A nested/sandboxed Wayland compositor (`cage`) is NOT reliable for this
+  GPU specifically** - on this NVIDIA+Intel hybrid box, headless `cage`
+  fails to grab the NVIDIA DRM device (already held by the real compositor)
+  and silently falls back to the Intel iGPU + a broken zink/GL path -
+  exercises a completely different code path than the live desktop, so a
+  "survives" result there proves nothing. Running the harness as a plain
+  separate process directly against the live Wayland session (still fully
+  isolated from plasmashell as a *process*, just sharing the display) reached
+  the real NVIDIA Vulkan path correctly and is what actually worked.
+- **`vulkan-validation-layers` was not installed on the host** (an immutable
+  Bazzite/rpm-ostree system - installing there needs a reboot to take
+  effect, not worth it for a diagnostic-only package). Installed inside the
+  `plasmabuild` toolbox instead (`sudo dnf install -y
+  vulkan-validation-layers`) and extracted the two files the loader actually
+  needs (`podman cp plasmabuild:/usr/lib64/libVkLayer_khronos_validation.so`
+  and `.../explicit_layer.d/VkLayer_khronos_validation.json`) to a host
+  directory, then ran the host-built `sceneviewer` binary directly (same
+  Fedora 44 base as the toolbox, confirmed ABI-compatible - it just runs) with
+  **both** `VK_LAYER_PATH` (manifest discovery) **and** `LD_LIBRARY_PATH`
+  (the manifest's `library_path` is a bare relative filename - the loader
+  `dlopen()`s it via the normal linker search path, not relative to the
+  manifest's own directory; without `LD_LIBRARY_PATH` this fails with a
+  misleading `VK_ERROR_LAYER_NOT_PRESENT` even though the manifest was found
+  fine - only visible with `VK_LOADER_DEBUG=all`).
+- **Note: `plasmabuild` is a `distrobox` container, not a `toolbox`-CLI one**
+  (confirm via `podman inspect <name> --format '{{.Config.Labels}}'` -
+  `manager:distrobox`) - the `toolbox` CLI refuses to `toolbox run` it
+  ("container is too old"); use `distrobox enter plasmabuild -- <cmd>`
+  instead, which works fine on the exact same container.
+
 ## Known remaining gaps (non-fatal)
 
 - The 3776778760 scene still logs, but renders fine without them: a **video
@@ -247,3 +352,8 @@ Not reported upstream (the repo is archived). Local patches.
   them.
 - **Real shadow casting** is still not implemented (fix 6 only makes the
   shadow-atlas *resource* resolve; nothing renders depth into it).
+- **3605722997's "Simple Audio Bars" effect** still doesn't render its own
+  content (its shader has a genuine author-side GLSL error, `frequency % 64`
+  on a float) - fix 9 stops it from corrupting the screen, but the bar-graph
+  visualizer itself is still absent, same "renders fine without it" category
+  as the other entries here.

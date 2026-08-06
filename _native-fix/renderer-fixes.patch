@@ -914,6 +914,76 @@ index a4814a2..8e30a39 100644
      struct QueryTex {
          idx                index { 0 };
          bool               share_ready { false };
+diff --git a/src/VulkanRender/SceneToRenderGraph.cpp b/src/VulkanRender/SceneToRenderGraph.cpp
+index 3f1f36e..b9ffa97 100644
+--- a/src/VulkanRender/SceneToRenderGraph.cpp
++++ b/src/VulkanRender/SceneToRenderGraph.cpp
+@@ -100,9 +100,64 @@ static void ToGraphPass(SceneNode* node, std::string_view output, i32 imgId, Ext
+     auto& rgraph = *extra.rgraph;
+     auto& scene  = *extra.scene;
+ 
+-    auto loadEffect = [node, &rgraph, &scene, &extra](SceneImageEffectLayer* effs) {
++    // 'output' gets redirected to the effect layer's first ping-pong buffer
++    // below (when the node's camera HasImgEffect()) so the base material
++    // renders into the effect chain instead of straight to the screen.
++    // Saved before that happens so loadEffect can still find the real
++    // destination if every effect on the layer fails to compile.
++    std::string_view final_output = output;
++
++    auto loadEffect = [node, &rgraph, &scene, &extra, final_output](SceneImageEffectLayer* effs) {
+         effs->ResolveEffect(scene.default_effect_mesh, "effect");
+ 
++        if (effs->EffectCount() == 0) {
++            // Every effect declared on this layer failed to compile (see
++            // WPSceneParser.cpp's "effect '...' failed to load" - a hard
++            // GLSL error, e.g. a wallpaper author's shader doing integer
++            // modulo on a float, which Wallpaper Engine's own compiler
++            // tolerates but glslang correctly rejects). The base layer's
++            // own material already rendered correctly into the first
++            // ping-pong buffer (see 'output = imgeff->FirstTarget()'
++            // below) - normally the last successful effect relays that
++            // into the real destination; with none, that relay never
++            // happens and the layer's content is silently dropped,
++            // leaving whatever was behind it - nothing, for a full-screen
++            // effect layer, i.e. a solid black rect.
++            //
++            // Relay it through with a copy pass IF AND ONLY IF the two
++            // buffers are the same size. CopyPass (see CopyPass.cpp) always
++            // issues a vkCmdCopyImage sized to the SOURCE's full extent,
++            // with no scaling - valid only when src and dst match exactly.
++            // A ping-pong buffer is sized to the effect layer's own
++            // declared canvas (WPSceneParser.cpp's
++            // scene.renderTargets[effect_ppong_a] = {wpimgobj.size...}),
++            // which very often does NOT match the actual output resolution
++            // (confirmed live: 2560x1440 source into a 1280x720
++            // destination) - vkCmdCopyImage has no scaling capability, so
++            // that mismatch is an out-of-bounds copy region
++            // (VUID-vkCmdCopyImage-dstOffset-00150), which is exactly what
++            // caused this to reproducibly take the whole GPU context down
++            // with VK_ERROR_DEVICE_LOST instead of just failing cleanly.
++            // A real fix for the mismatched case needs a scaling blit
++            // (sample-based shader pass), which does not exist in this
++            // renderer yet - out of scope here. Falling back to the
++            // original silently-dropped behaviour for that case is
++            // strictly safer than a copy that can corrupt/hang the GPU.
++            auto sameSize = [&scene](std::string_view a, std::string_view b) {
++                auto ia = scene.renderTargets.find(std::string(a));
++                auto ib = scene.renderTargets.find(std::string(b));
++                if (ia == scene.renderTargets.end() || ib == scene.renderTargets.end())
++                    return false;
++                return ia->second.width == ib->second.width
++                    && ia->second.height == ib->second.height;
++            };
++            if (sameSize(effs->FirstTarget(), final_output)) {
++                rg::addCopyPass(rgraph, rg::createTexDesc(std::string(effs->FirstTarget())),
++                                rg::createTexDesc(std::string(final_output)));
++            }
++            return;
++        }
++
+         for (usize i = 0; i < effs->EffectCount(); i++) {
+             auto& eff     = effs->GetEffect(i);
+             auto  cmdItor = eff->commands.begin();
 diff --git a/src/VulkanRender/VulkanRender.cpp b/src/VulkanRender/VulkanRender.cpp
 index 9fb7776..8ccfcdc 100644
 --- a/src/VulkanRender/VulkanRender.cpp
