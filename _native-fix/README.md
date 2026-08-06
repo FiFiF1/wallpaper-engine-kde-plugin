@@ -343,6 +343,31 @@ desktop down while iterating - took real setup, worth recording:
   ("container is too old"); use `distrobox enter plasmabuild -- <cmd>`
   instead, which works fine on the exact same container.
 
+## Known remaining gap (renders fully black - not fixed this session)
+
+**3448290956** ("Interactions" GBC Subaru puppet-rigged wallpaper) renders
+completely black - not a partial/cosmetic issue like everything else in
+this file, nothing draws at all. Traced (but deliberately not fixed - open-
+ended binary reverse-engineering, different in character from every other
+entry here) to `WPMdlParser.cpp`'s puppet/bone parser: every one of this
+wallpaper's five face-rig puppet files (`脸_puppet.mdl` /face/,
+`左眼白_puppet.mdl` /left eye white/, `左眼皮_puppet.mdl` /left eyelid/,
+twice, `右眼皮_puppet.mdl` /right eyelid/) fails - four log `bones: 0`
+after a full parse (`mdlv: 23`), the fifth hits an outright corrupted read,
+`mdl wrong bone parent index 516095061` (obviously not a real bone index).
+That corrupted value strongly suggests a byte-alignment mismatch earlier in
+the parse - `WPMdlParser.cpp` is a heuristic, reverse-engineered binary
+format with no spec (lots of "unk, skip N bytes" reads and format-version
+branches already in the code, e.g. `alt_mdl_format`/`mdl.mdla` handling) -
+consistent with the version-specific format gaps fixes 2 and (the .tex
+side of) this whole file's earlier entries hit, but pinning down exactly
+*which* field this wallpaper's format version handles differently would
+need real trial-and-error against the actual file bytes, not just reading
+code. A separate, unrelated shader bug also present on the same wallpaper:
+effect "Iris Movement +" fails to compile (`'*' : wrong operand types` -
+multiplying a vec4 by a vec2 - an author-side GLSL bug, same category as
+the "Simple Audio Bars"/fix 9 shader error, not a renderer bug).
+
 ## Known remaining gaps (non-fatal)
 
 - The 3776778760 scene still logs, but renders fine without them: a **video
