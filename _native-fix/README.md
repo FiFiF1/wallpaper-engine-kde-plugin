@@ -457,3 +457,67 @@ Then apply `renderer-fixes.patch` as usual, which wires it into
 static `qjs` lib target only, its CLI/test executables excluded from the
 default build) and links it into `src/CMakeLists.txt`'s
 `WallpaperEngineKde`/`wescene-renderer` target.
+
+## 11. Object "parent" field never composed - entrance animation lands in a corner
+
+The other half of "the opening animation is looping and only in the
+corner" (fix 10 was the looping half). `objects[].parent` - a WP Engine
+scene object referencing an ancestor's id, meant to have its own origin
+composed with that ancestor's - was never read anywhere in this parser
+(confirmed by an exhaustive grep for the JSON key `"parent"` across the
+whole tree: zero matches before this fix). Worse, "group" objects - ones
+with no `image`/`particle`/`sound`/`light` key, existing purely to give a
+set of children a shared coordinate frame - were silently skipped entirely
+by the object-type dispatch loop, so they never even became a `SceneNode`
+a child could reference.
+
+For 3605722997's entrance-animation layer specifically: its authored local
+origin, `(-1157.76, -808.69)`, is (almost exactly) the *negation* of its
+group parent's own origin, `(1157.76, 808.69)` - once correctly composed
+(`parent_origin + child_local_origin`), that resolves to world origin
+`(0,0)`, the bottom-left corner of the scene's 2560x1440 canvas, which
+combined with the object's `"alignment": "bottomleft"` produces a perfectly
+centered, fullscreen quad exactly matching the canvas. With the `parent`
+field silently ignored, the child's origin was instead used as-is as an
+*absolute* world coordinate, landing the quad's center at `(122, -89)`
+instead of `(1280, 720)` - numerically reconstructed and confirmed to
+produce a quad whose visible intersection with the screen is only its
+bottom-left ~55%x44%, matching the reported symptom exactly.
+
+**Fix: use `SceneNode`'s own existing parent/child hierarchy** (`SceneNode.h`'s
+`AppendChild()` + `m_parent`, and `SceneNode.cpp`'s `UpdateTrans()`, which
+already correctly composes `m_trans = parent->ModelTrans() * GetLocalTrans()`
+- this machinery was already complete and correct, just never actually used
+by the scene parser for ordinary objects). `WPSceneParser.cpp` now:
+
+- Tracks every node it creates in a new `ParseContext::id_node_map` (id ->
+  `SceneNode`), populated as each object is parsed.
+- Has a new pre-pass, `ParseGroupObjs()`, that runs before the main
+  content-object loop and creates a bare `SceneNode` (no mesh, just a
+  transform) for every content-less "group" object that has an id -
+  registering it in `id_node_map` immediately, so content objects can find
+  it regardless of which one appears first in the JSON array. A group's own
+  `"visible"` is deliberately not checked - it exists only to anchor a
+  coordinate frame, never to render or play anything itself.
+- Resolves each object's `"parent"` (added as a new field on
+  `wpscene::WPImageObject`, read alongside its existing `"id"` field) via a
+  new `AppendToParentOrRoot()` helper: attach to the referenced parent node
+  if found in `id_node_map`, otherwise fall back to the scene root exactly
+  as before (so an object with no `"parent"` key, or one referencing an id
+  this parser genuinely never created a node for, behaves identically to
+  pre-fix - no regression for the common case).
+
+Only wired into `WPImageObject` (what the reported bug needed) -
+`WPParticleObject`/`WPLightObject` don't currently have any known scene
+depending on parent composition, left as a natural follow-up if one turns
+up rather than speculatively wired now.
+
+Verified two ways before ever touching the live desktop: (1) temporary
+logging at the resolution call site, confirming id=138 (the entrance
+animation) correctly resolved parent id=145 to a real node - and, as a
+bonus, that two *other*, previously-silently-broken parent references
+elsewhere in the same scene (ids 49 and 163) now resolve too; (2) the
+isolated Vulkan-validation harness, clean across this wallpaper and two
+unrelated ones (no new `VK_ERROR_*`, no coredump). Confirmed live: the
+corner artifact is gone at every point checked, including immediately after
+a fresh restart while the entrance animation would still be active.

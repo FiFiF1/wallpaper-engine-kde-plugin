@@ -1028,10 +1028,44 @@ index 9fb7776..8ccfcdc 100644
  
  #if ENABLE_RENDERDOC_API
 diff --git a/src/WPSceneParser.cpp b/src/WPSceneParser.cpp
-index 487c9f9..6d18bb7 100644
+index 487c9f9..a0f8a28 100644
 --- a/src/WPSceneParser.cpp
 +++ b/src/WPSceneParser.cpp
-@@ -217,6 +217,13 @@ BlendMode ParseBlendMode(std::string_view str) {
+@@ -55,8 +55,33 @@ struct ParseContext {
+     std::shared_ptr<SceneNode> effect_camera_node;
+     std::shared_ptr<SceneNode> global_camera_node;
+     std::shared_ptr<SceneNode> global_perspective_camera_node;
++
++    // Every SceneNode created while parsing "objects", keyed by its WP-Engine
++    // JSON "id" - populated as each image/particle/light/group node is
++    // created, so a LATER object's "parent" reference can be resolved
++    // regardless of array order (WP Engine scenes commonly declare a
++    // content object before the group node it's parented under would be
++    // reached by array position). See AppendToParentOrRoot.
++    wallpaper::Map<i32, std::shared_ptr<SceneNode>> id_node_map;
+ };
+ 
++// Attaches `node` to the SceneNode registered under `parent_id` (composing
++// its transform with that ancestor via SceneNode's existing
++// AppendChild/UpdateTrans machinery - see SceneNode.cpp), or to the scene
++// root if there's no such id (parent_id < 0, meaning the JSON had no
++// "parent" key at all, or referenced an id this parser never created a
++// node for). Every wpscene::WP*Object's "origin" field is otherwise
++// (incorrectly) treated as an absolute world-space coordinate - see fix 11
++// in _native-fix/README.md.
++void AppendToParentOrRoot(ParseContext& context, i32 parent_id,
++                          const std::shared_ptr<SceneNode>& node) {
++    if (parent_id >= 0 && context.id_node_map.count(parent_id) != 0) {
++        context.id_node_map.at(parent_id)->AppendChild(node);
++    } else {
++        context.scene->sceneGraph->AppendChild(node);
++    }
++}
++
+ using WPObjectVar = std::variant<wpscene::WPImageObject, wpscene::WPParticleObject,
+                                  wpscene::WPSoundObject, wpscene::WPLightObject>;
+ 
+@@ -217,6 +242,13 @@ BlendMode ParseBlendMode(std::string_view str) {
  
  void ParseSpecTexName(std::string& name, const wpscene::WPMaterial& wpmat,
                        const WPShaderInfo& sinfo) {
@@ -1045,7 +1079,7 @@ index 487c9f9..6d18bb7 100644
      if (IsSpecTex(name)) {
          if (name == "_rt_FullFrameBuffer") {
              name = SpecTex_Default;
-@@ -240,8 +247,28 @@ void ParseSpecTexName(std::string& name, const wpscene::WPMaterial& wpmat,
+@@ -240,8 +272,28 @@ void ParseSpecTexName(std::string& name, const wpscene::WPMaterial& wpmat,
          } else if (sstart_with(name, WE_HALF_COMPO_BUFFER_PREFIX)) {
          } else if (sstart_with(name, WE_QUARTER_COMPO_BUFFER_PREFIX)) {
          } else if (sstart_with(name, WE_FULL_COMPO_BUFFER_PREFIX)) {
@@ -1075,7 +1109,7 @@ index 487c9f9..6d18bb7 100644
          }
      }
  }
-@@ -336,8 +363,18 @@ bool LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
+@@ -336,8 +388,18 @@ bool LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
          if (IsSpecTex(name)) {
              if (IsSpecLinkTex(name)) {
                  svData.renderTargets.push_back({ i, name });
@@ -1095,7 +1129,7 @@ index 487c9f9..6d18bb7 100644
              } else {
                  svData.renderTargets.push_back({ i, name });
                  const auto& rt = pScene->renderTargets.at(name);
-@@ -457,6 +494,10 @@ void LoadConstvalue(SceneMaterial& material, const wpscene::WPMaterial& wpmat,
+@@ -457,6 +519,10 @@ void LoadConstvalue(SceneMaterial& material, const wpscene::WPMaterial& wpmat,
              LOG_ERROR("ShaderValue: %s not found in glsl", name.c_str());
          } else {
              material.customShader.constValues[glname] = value;
@@ -1106,7 +1140,7 @@ index 487c9f9..6d18bb7 100644
          }
      }
  }
-@@ -522,7 +563,8 @@ void InitContext(ParseContext& context, fs::VFS& vfs, wpscene::WPScene& sc) {
+@@ -522,7 +588,8 @@ void InitContext(ParseContext& context, fs::VFS& vfs, wpscene::WPScene& sc) {
          gb["g_TexelSize"]     = std::array { 1.0f / 1920.0f, 1.0f / 1080.0f };
          gb["g_TexelSizeHalf"] = std::array { 1.0f / 1920.0f / 2.0f, 1.0f / 1080.0f / 2.0f };
  
@@ -1116,6 +1150,91 @@ index 487c9f9..6d18bb7 100644
          gb["g_NormalModelMatrix"] = ShaderValue::fromMatrix(Matrix4f::Identity());
      }
  
+@@ -593,6 +660,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
+                                                  Vector3f(wpimgobj.angles.data()));
+     LoadAlignment(*spImgNode, wpimgobj.alignment, { wpimgobj.size[0], wpimgobj.size[1] });
+     spImgNode->ID() = wpimgobj.id;
++    context.id_node_map[wpimgobj.id] = spImgNode;
+ 
+     SceneMaterial     material;
+     WPShaderValueData svData;
+@@ -886,7 +954,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
+             }
+         }
+     }
+-    context.scene->sceneGraph->AppendChild(spImgNode);
++    AppendToParentOrRoot(context, wpimgobj.parent, spImgNode);
+ }
+ 
+ struct ParticleChildPtr {
+@@ -1079,6 +1147,54 @@ void ParseLightObj(ParseContext& context, wpscene::WPLightObject& light_obj) {
+     context.scene->sceneGraph->AppendChild(node);
+ }
+ 
++// WP Engine scenes can declare purely-structural "group" objects - no
++// image/particle/sound/light key, existing only to give a set of children a
++// shared origin/rotation/scale other objects then parent under (see fix 11
++// in _native-fix/README.md - e.g. an entrance-animation clip + its voice
++// lines, grouped so they can all be positioned/triggered together). This
++// parser used to skip such objects entirely (the object-type dispatch below
++// only creates a WPObjectVar for the four content keys), so every one of
++// their children's "origin" was later read as an absolute world coordinate
++// instead of being composed with this shared one - the child's own JSON
++// origin is typically authored as an offset FROM the group, e.g. exactly
++// cancelling it out for a group meant to sit at world origin, which reads
++// as "meaningless, arbitrary-looking numbers" until you realize that.
++//
++// A group's own "visible" is intentionally not checked here (unlike
++// content objects) - it exists purely to anchor a coordinate frame, not to
++// render or play anything itself, so whether IT is "visible" doesn't
++// change whether creating it is correct; only its children's own
++// visibility matters, and that's already handled where each of those gets
++// parsed.
++void ParseGroupObjs(ParseContext& context, const nlohmann::json& objects) {
++    for (const auto& obj : objects) {
++        if (obj.contains("image") && ! obj.at("image").is_null()) continue;
++        if (obj.contains("particle") && ! obj.at("particle").is_null()) continue;
++        if (obj.contains("sound") && ! obj.at("sound").is_null()) continue;
++        if (obj.contains("light") && ! obj.at("light").is_null()) continue;
++        if (! obj.contains("id")) continue; // unreferenceable, nothing to gain by keeping it
++
++        i32 id = -1;
++        GET_JSON_NAME_VALUE_NOWARN(obj, "id", id);
++
++        std::array<float, 3> origin { 0.0f, 0.0f, 0.0f };
++        std::array<float, 3> angles { 0.0f, 0.0f, 0.0f };
++        std::array<float, 3> scale { 1.0f, 1.0f, 1.0f };
++        GET_JSON_NAME_VALUE_NOWARN(obj, "origin", origin);
++        GET_JSON_NAME_VALUE_NOWARN(obj, "angles", angles);
++        GET_JSON_NAME_VALUE_NOWARN(obj, "scale", scale);
++
++        auto node = std::make_shared<SceneNode>(Vector3f(origin.data()), Vector3f(scale.data()),
++                                                Vector3f(angles.data()));
++        node->ID() = id;
++        context.id_node_map[id] = node;
++
++        i32 parent_id = -1;
++        GET_JSON_NAME_VALUE_NOWARN(obj, "parent", parent_id);
++        AppendToParentOrRoot(context, parent_id, node);
++    }
++}
++
+ template<typename T>
+ void AddWPObject(std::vector<WPObjectVar>& objs, const nlohmann::json& json_obj, fs::VFS& vfs) {
+     T wpobj;
+@@ -1149,6 +1265,12 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
+ 
+     context.scene->scene_id = scene_id;
+ 
++    // Must run before the content-object loop below so a content object's
++    // "parent" (resolved via AppendToParentOrRoot inside ParseImageObj
++    // etc.) can already find its group node regardless of which one
++    // appears first in the JSON array.
++    ParseGroupObjs(context, json.at("objects"));
++
+     WPShaderParser::InitGlslang();
+ 
+     for (WPObjectVar& obj : wp_objs) {
 diff --git a/src/WPShaderParser.cpp b/src/WPShaderParser.cpp
 index 7c3eaec..ba4a4f4 100644
 --- a/src/WPShaderParser.cpp
@@ -1359,6 +1478,32 @@ index ec396e4..5088150 100644
                  int32_t w, h, n;
                  auto*   data =
                      stbi_load_from_memory((const unsigned char*)result, src_size, &w, &h, &n, 4);
+diff --git a/src/wpscene/WPImageObject.cpp b/src/wpscene/WPImageObject.cpp
+index 75580f8..39d734b 100644
+--- a/src/wpscene/WPImageObject.cpp
++++ b/src/wpscene/WPImageObject.cpp
+@@ -146,6 +146,7 @@ bool WPImageObject::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
+     GET_JSON_NAME_VALUE_NOWARN(jImage, "fullscreen", fullscreen);
+ 	GET_JSON_NAME_VALUE_NOWARN(json, "name", name);
+ 	GET_JSON_NAME_VALUE_NOWARN(json, "id", id);
++	GET_JSON_NAME_VALUE_NOWARN(json, "parent", parent);
+ 	GET_JSON_NAME_VALUE_NOWARN(json, "colorBlendMode", colorBlendMode);
+ 	if(!fullscreen) {
+ 		GET_JSON_NAME_VALUE(json, "origin", origin);	
+diff --git a/src/wpscene/WPImageObject.h b/src/wpscene/WPImageObject.h
+index 3e40257..00cd43d 100644
+--- a/src/wpscene/WPImageObject.h
++++ b/src/wpscene/WPImageObject.h
+@@ -60,6 +60,9 @@ public:
+     };
+     bool                       FromJson(const nlohmann::json&, fs::VFS&);
+     int32_t                    id { 0 };
++    // -1 means "no parent" (WP Engine JSON simply omits the key for a
++    // root-level object) - a real id would never be negative.
++    int32_t                    parent { -1 };
+     std::string                name;
+     std::array<float, 3>       origin { 0.0f, 0.0f, 0.0f };
+     std::array<float, 3>       scale { 1.0f, 1.0f, 1.0f };
 diff --git a/src/wpscene/WPMaterial.cpp b/src/wpscene/WPMaterial.cpp
 index 5fd9367..5b9afa3 100644
 --- a/src/wpscene/WPMaterial.cpp
