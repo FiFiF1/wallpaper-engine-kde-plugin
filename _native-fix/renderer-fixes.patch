@@ -1410,6 +1410,85 @@ index 3d5729c..621d785 100644
      WPCameraParallax     m_parallax;
      double               m_dayTime { 0.0f };
      std::array<float, 2> m_texelSize { 1.0f / 1920.0f, 1.0f / 1080.0f };
+diff --git a/src/WPSoundParser.cpp b/src/WPSoundParser.cpp
+index 0c58466..1819db8 100644
+--- a/src/WPSoundParser.cpp
++++ b/src/WPSoundParser.cpp
+@@ -12,7 +12,23 @@ using namespace wallpaper;
+ enum class PlaybackMode
+ {
+     Random,
+-    Loop
++    Loop,
++    // Play through m_soundPaths once, in order, then go silent - WP Engine's
++    // "single" mode. Previously unrecognized here (anything not exactly
++    // "loop" or "random" silently fell back to Loop), so a "single" sound -
++    // typically authored to be triggered once by a SceneScript, or just
++    // meant to play once on load with no trigger at all - looped forever
++    // instead. That's the root cause behind "audio voices are garbled
++    // together": two alternate-language intro voice lines, both
++    // playbackmode "single", both looping indefinitely with no way to stop
++    // either (this renderer has no scripting-driven trigger for them yet -
++    // see fix 12's notes in the README for the much larger, separate
++    // per-stream playback-control subsystem a *complete* single-active-
++    // track fix would need). This alone doesn't make just one of the two
++    // play - both still start together on load - but it turns an endless
++    // overlapping loop into each track playing through once and then
++    // falling silent, which is a real, safe improvement on its own.
++    Single
+ };
+ 
+ static PlaybackMode ToPlaybackMode(std::string_view s) {
+@@ -20,6 +36,8 @@ static PlaybackMode ToPlaybackMode(std::string_view s) {
+         return PlaybackMode::Loop;
+     else if (s == "random")
+         return PlaybackMode::Random;
++    else if (s == "single")
++        return PlaybackMode::Single;
+     return PlaybackMode::Loop;
+ };
+ 
+@@ -36,6 +54,12 @@ public:
+     virtual ~WPSoundStream() = default;
+ 
+     uint64_t NextPcmData(void* pData, uint32_t frameCount) override {
++        // Single mode: once every path has played through exactly once,
++        // stay silent forever instead of wrapping back to the start - see
++        // the PlaybackMode::Single comment above for why this matters.
++        if (m_config.mode == PlaybackMode::Single && m_switchCount >= m_soundPaths.size())
++            return 0;
++
+         // first
+         if (! m_curActive) {
+             Switch();
+@@ -44,6 +68,8 @@ public:
+         // loop
+         uint64_t frameReads = m_curActive->NextPcmData(pData, frameCount);
+         if (frameReads == 0) {
++            if (m_config.mode == PlaybackMode::Single && m_switchCount >= m_soundPaths.size())
++                return 0;
+             Switch();
+             frameReads = m_curActive->NextPcmData(pData, frameCount);
+         }
+@@ -59,6 +85,7 @@ public:
+     };
+     void PassDesc(const Desc& d) override { m_desc = d; }
+     void Switch() {
++        m_switchCount++;
+         std::string path = m_soundPaths[LoopIndex()];
+         // LOG_INFO("Switch to audio file: %s", path.c_str());
+         m_curActive = audio::CreateSoundStream(vfs.Open("/assets/" + path), m_desc);
+@@ -74,6 +101,10 @@ private:
+     Config   m_config;
+     Desc     m_desc;
+     uint32_t m_curIndex { 0 };
++    // How many times Switch() has moved to a (possibly repeated, for a
++    // single-path list) next file - once this reaches m_soundPaths.size(),
++    // every path has played through exactly once.
++    uint32_t m_switchCount { 0 };
+ 
+     const std::vector<std::string> m_soundPaths;
+     std::unique_ptr<SoundStream>   m_curActive;
 diff --git a/src/WPTexImageParser.cpp b/src/WPTexImageParser.cpp
 index ec396e4..5088150 100644
 --- a/src/WPTexImageParser.cpp

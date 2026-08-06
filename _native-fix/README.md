@@ -521,3 +521,51 @@ isolated Vulkan-validation harness, clean across this wallpaper and two
 unrelated ones (no new `VK_ERROR_*`, no coredump). Confirmed live: the
 corner artifact is gone at every point checked, including immediately after
 a fresh restart while the entrance animation would still be active.
+
+## 12. `playbackmode: "single"` never implemented - sound objects always looped forever
+
+The remaining half of "the audio voices are garbled together" (3605722997
+has two alternate-language intro voice-line sound objects, both
+`playbackmode: "single"`). `WPSoundParser.cpp`'s `ToPlaybackMode()`
+recognized exactly two strings, `"loop"` and `"random"` - anything else,
+including `"single"`, silently fell back to `Loop`. `WPSoundStream` has no
+"play once and stop" concept at all: `NextPcmData()` unconditionally calls
+`Switch()` again whenever the current file ends, and `Switch()`'s index
+wraps back to 0 once it passes the end of the path list - for a
+single-path sound object (both of these are: one path each), that means
+"restart the same one file, forever" from the moment the scene loads.
+
+Added real `Single` mode support: `WPSoundStream` now counts how many times
+`Switch()` has advanced (`m_switchCount`), and once that count reaches the
+path list's length - every path has played through exactly once - further
+reads return 0 frames (silence) instead of switching again.
+
+**This is a real, complete fix for wallpapers that just want one-shot
+audio on load - but it is not a complete fix for *this* wallpaper's actual
+intent**, and it's worth being precise about why: WP Engine's real design
+for these two objects is that NEITHER plays automatically at all - a
+SceneScript on their shared parent (see fix 10/11's description of object
+145) is supposed to pick exactly one of them (based on a language
+property) and call that one's own `.play()` when the intro layer becomes
+visible, explicitly stopping the other. This renderer has no mechanism for
+a script to trigger/stop an individual sound object at all - confirmed by
+reading `Audio/include/Audio/SoundManager.h`: its entire API is
+`MountStream()` (fire-and-forget, no handle returned), `UnMountAll()` (every
+mounted stream at once), and a *global* `Play()`/`Pause()`/`SetVolume()` -
+there is no per-stream identity anywhere to attach a `.play()`/`.stop()`
+binding to in the first place. Building that - a real handle-based
+per-stream control API in `SoundManager`, a `thisScene.getLayer(name)`
+registry spanning both image and sound objects, and `visible: {script}`
+evaluation (a second, distinct scripting hook from fix 10's
+`constantshadervalue.script`) - is a genuinely separate, comparably-sized
+subsystem to fix 10's whole JS engine addition, not a small extension of
+it. Deliberately not attempted in this session: scoped as a real follow-up
+if this specific "select one of several script-gated audio tracks" pattern
+turns out to matter beyond this one wallpaper.
+
+Net effect of what *is* fixed here: both intro voice lines now play through
+once (still overlapping each other, since both still start together on
+scene load with no selection logic) and then go silent, rather than
+looping over each other forever. Verified via the isolated Vulkan-
+validation harness (clean, no regressions) and live (no `VK_ERROR_*`, no
+coredump).
