@@ -11,6 +11,12 @@ T.Control {
     property alias text: text_label.text
     property alias text_color: text_label.color
 
+    // Per-row reset-to-default button. Hidden unless the caller has a
+    // non-default value to reset (resetVisible), so rows sitting at their
+    // default don't grow a button with nothing to do.
+    property bool resetVisible: false
+    signal resetRequested()
+
     property alias color: rect_back.color
     property alias border: rect_back.border
     property alias radius: rect_back.radius
@@ -82,6 +88,19 @@ T.Control {
                 bottomPadding: 5
 
                 contentItem: Item { id: action_empty }
+            }
+
+            ToolButton {
+                id: reset_button
+                visible: item_root.resetVisible
+                Layout.preferredWidth: visible ? implicitWidth : 0
+                icon.name: "edit-undo-symbolic"
+                icon.color: item_root.text_color
+                display: AbstractButton.IconOnly
+                text: "Reset to default"
+                ToolTip.visible: hovered
+                ToolTip.text: text
+                onClicked: item_root.resetRequested()
             }
         }
         

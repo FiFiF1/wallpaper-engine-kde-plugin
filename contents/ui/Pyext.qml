@@ -57,6 +57,11 @@ Item {
     function reset_wallpaper_config(id) {
         return ws_server.jrpc.send("reset_wallpaper_config", [id]);
     }
+    // Reset a single per-wallpaper setting back to default, leaving every
+    // other saved override on this wallpaper untouched.
+    function delete_wallpaper_config_key(id, key) {
+        return ws_server.jrpc.send("delete_wallpaper_config_key", [id, key]);
+    }
     // Public Steam Workshop listing for the Workshop tab. Read-only browsing:
     // subscribing still happens in Steam itself.
     function workshop_browse(sort, page, query, tags, days) {

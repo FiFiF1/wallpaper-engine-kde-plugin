@@ -53,6 +53,20 @@ class Main:
         cfg_file: Path = self.__wallpaper_config_file(id)
         cfg_file.unlink()
 
+    def delete_wallpaper_config_key(self, id: str, key: str) -> None:
+        """Reset a single per-wallpaper setting back to its default, leaving
+        every other saved override untouched. write_wallpaper_config() only
+        merges (dict.update) - it can add or overwrite a key but never
+        remove one - so undoing just one setting needed a real delete, not
+        another write."""
+        cfg: dict = self.read_wallpaper_config(id)
+        if key not in cfg:
+            return
+        del cfg[key]
+        cfg_file: Path = self.__wallpaper_config_file(id)
+        with open(cfg_file, "w+") as f:
+            json.dump(cfg, f)
+
     def __favorites_file(self) -> Path:
         return self.config_dir / 'favorites.json'
 
@@ -1004,6 +1018,7 @@ get_folder_list.default_opt = {"only_dir": True, "fallbacks": []}
 jrpc.add_method(M.read_wallpaper_config)
 jrpc.add_method(M.write_wallpaper_config)
 jrpc.add_method(M.reset_wallpaper_config)
+jrpc.add_method(M.delete_wallpaper_config_key)
 jrpc.add_method(M.workshop_browse)
 jrpc.add_method(M.workshop_item)
 jrpc.add_method(M.wallpaper_caps)

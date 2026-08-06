@@ -433,11 +433,52 @@ RowLayout {
         readonly property string displayDesc:
             showTranslated && translatedDesc ? translatedDesc : descRaw
 
+        // ---- what this wallpaper can actually do ---------------------------
+        // The Option panel used to show every control (Mute, Volume, Mouse
+        // Input, Speed, Frame Rate, Display mode) for every wallpaper
+        // regardless of type - a web wallpaper has no "speed", a video has no
+        // "fps", and plenty of scene/video wallpapers carry no audio at all,
+        // so those rows just did nothing. wpmodel.type is already known
+        // synchronously from the library grid's own model data; only whether
+        // THIS wallpaper actually has sound needs asking the python helper
+        // (mirrors SettingPage.qml's existing wallpaper_caps() gating for the
+        // Settings tab - same helper, same "unknown means show it" default).
+        readonly property string wpType: wpmodel.type || ""
+        readonly property bool isVideo: wpType === "video"
+        readonly property bool isScene: wpType === "scene"
+        readonly property bool isWeb:   wpType === "web"
+
+        property var caps: null
+        readonly property bool hasSound: !caps || caps.sound !== false
+
+        function refreshCaps() {
+            const path = wpmodel.path;
+            if(!pyext || !pyext.ok || !path) { right_content.caps = null; return; }
+            pyext.wallpaper_caps(path).then((res) => {
+                // Ignore an answer about a wallpaper that is no longer selected.
+                if(right_content.wpmodel.path !== path) return;
+                right_content.caps = res || null;
+            }).catch((reason) => {
+                console.error("wallpaper_caps failed", reason);
+                right_content.caps = null;
+            });
+        }
+
+        Component.onCompleted: refreshCaps()
+
+        // The helper connects a moment after the dialog is built, so the first
+        // attempt can land before it is up - matches SettingPage.qml's pattern.
+        Connections {
+            target: pyext
+            function onOkChanged() { right_content.refreshCaps(); }
+        }
+
         // A translation of the previous wallpaper must never linger on the next.
         onWpmodelChanged: {
             showTranslated = false;
             translatedTitle = "";
             translatedDesc = "";
+            refreshCaps();
         }
 
         function toggleTranslate() {
@@ -816,6 +857,19 @@ RowLayout {
 
                         config_resets.clear();
 
+                        // Plasma calls this (via config.qml's saveConfig() hook)
+                        // on every single Apply/OK press, whether or not this
+                        // panel actually has anything pending - the debounced
+                        // perOptSave timer above has usually already saved real
+                        // edits several hundred ms earlier. Bumping
+                        // cfg_PerOptChanged unconditionally meant every Apply/OK
+                        // click produced a fresh "changed" cfg_ value a moment
+                        // after Plasma captured its own dirty-tracking baseline,
+                        // so the Apply button immediately re-armed itself again -
+                        // "the apply button doesn't reset and can be pressed".
+                        // Only bump it when a write actually happened.
+                        if(pending.length === 0) return;
+
                         Promise.all(pending).then(() => {
                             cfg_PerOptChanged = cfg_PerOptChanged + 1;
                         }).catch(reason => console.error("save_changes failed: " + reason));
@@ -836,6 +890,54 @@ RowLayout {
                         delete config_changes[workshopid];
                         config = {}
                         perOptSave.restart();
+                    }
+                    // Reset one setting back to default, leaving every other
+                    // saved override on this wallpaper alone - unlike
+                    // reset_config() above, which wipes the whole thing.
+                    // Bypasses the config_changes/perOptSave debounce path
+                    // (that path can only ADD/overwrite keys - see
+                    // write_wallpaper_config) and instead deletes the key
+                    // directly, then bumps cfg_PerOptChanged itself once
+                    // that (and dropping any pending unsaved edit for the
+                    // same key) has actually completed - same
+                    // write-before-signal ordering as save_changes(), for
+                    // the same reason.
+                    function reset_config_key(key) {
+                        if(!key || !workshopid) return;
+                        const wid = workshopid;
+                        const pending = [];
+                        let hadPending = false;
+
+                        if (config_changes[wid] && config_changes[wid].hasOwnProperty(key)) {
+                            delete config_changes[wid][key];
+                            hadPending = true;
+                        }
+
+                        if (config.hasOwnProperty(key)) {
+                            pending.push(pyext.delete_wallpaper_config_key(wid, key).then(() => {
+                                if (wid === right_opts.workshopid) {
+                                    const newConfig = Object.assign({}, right_opts.config);
+                                    delete newConfig[key];
+                                    right_opts.config = newConfig;
+                                }
+                            }));
+                        }
+
+                        Promise.all(pending).then(() => {
+                            // right_opts.config's own reassignment above already
+                            // fires configChanged (which the Repeater listens to,
+                            // to rebuild every row's control with fresh values -
+                            // see Component.onCompleted below). But a key that
+                            // was ONLY a pending, not-yet-saved edit never
+                            // touches `config` at all, so that path alone
+                            // wouldn't refresh the row's control back to its
+                            // default - emit both change signals explicitly so
+                            // the UI updates correctly regardless of which
+                            // state the key was in.
+                            if (hadPending) this.config_changesChanged();
+                            this.configChanged();
+                            cfg_PerOptChanged = cfg_PerOptChanged + 1;
+                        }).catch(reason => console.error("reset_config_key failed: " + reason));
                     }
                     function in_config_changes(key) {
                         return config_changes.hasOwnProperty(workshopid) && config_changes[workshopid].hasOwnProperty(key);
@@ -877,6 +979,10 @@ RowLayout {
                                 mark_: markModel,
                                 text: 'Display',
                                 config_key: 'display_mode',
+                                // Only video/scene backends read displayMode
+                                // (Mpv.qml/QtMultimedia.qml/Scene.qml) -
+                                // QtWebView.qml has no reference to it at all.
+                                visible: right_content.isVideo || right_content.isScene,
                                 comp: right_opt_combox,
                                 props: {
                                     model: [
@@ -899,6 +1005,9 @@ RowLayout {
                             {
                                 text: 'Mute Audio',
                                 config_key: 'mute_audio',
+                                // Plenty of scene/video wallpapers carry no
+                                // audio track at all - hide the noise.
+                                visible: right_content.hasSound,
                                 comp: right_opt_switch,
                                 props: {
                                     def_val: cfg_MuteAudio
@@ -907,6 +1016,7 @@ RowLayout {
                             {
                                 text: 'Volume',
                                 config_key: 'volume', 
+                                visible: right_content.hasSound,
                                 comp: right_opt_slider,
                                 props: {
                                     def_val: cfg_Volume,
@@ -918,6 +1028,9 @@ RowLayout {
                             {
                                 text: 'Speed',
                                 config_key: 'speed',
+                                // Only video and scene have a playback rate;
+                                // a web page ignores it entirely.
+                                visible: right_content.isVideo || right_content.isScene,
                                 comp: right_opt_slider,
                                 props: {
                                     def_val: cfg_Speed,
@@ -930,6 +1043,10 @@ RowLayout {
                             {
                                 text: 'Frame Rate',
                                 config_key: 'fps',
+                                // Fps drives the scene renderer and the web
+                                // view's own render loop; a video plays at its
+                                // own native framerate and never reads it.
+                                visible: right_content.isScene || right_content.isWeb,
                                 comp: right_opt_slider,
                                 props: {
                                     def_val: cfg_Fps,
@@ -941,6 +1058,10 @@ RowLayout {
                             {
                                 text: 'Mouse Input',
                                 config_key: 'mouse_input',
+                                // Hooking the mouse goes through the native
+                                // scene library, so this does nothing for a
+                                // video or a web page (matches SettingPage.qml).
+                                visible: libcheck.wallpaper && right_content.isScene,
                                 comp: right_opt_switch,
                                 props: {
                                     def_val: cfg_MouseInput,
@@ -1028,12 +1149,18 @@ RowLayout {
                         OptionItem {
                             text: modelData.text
                             text_color: Kirigami.Theme.textColor
+                            // Absent means "no capability check for this row",
+                            // e.g. flip/rotate/zoom/offset/filters, which work
+                            // identically for every backend.
+                            visible: modelData.visible !== false
 
                             property bool is_changed: right_opts.config && 
                                 right_opts.config_changes && 
                                 right_opts.has_change(modelData.config_key)
 
                             icon: is_changed ? Qt.resolvedUrl('../../images/edit-pencil.svg') : ''
+                            resetVisible: is_changed
+                            onResetRequested: right_opts.reset_config_key(modelData.config_key)
                             actor: Loader {
                                 sourceComponent: modelData.comp
                                 onLoaded: {
