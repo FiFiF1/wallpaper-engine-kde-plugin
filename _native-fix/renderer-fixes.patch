@@ -483,7 +483,7 @@ index 69bca22..0e17594 100644
      // bool IsStarted() const { return ma_device_is_started(&m_device); }
      // bool IsStopped() const { return ma_device_get_state(&m_device) == MA_STATE_STOPPED; }
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
-index 8dd28c9..6234323 100644
+index 8dd28c9..cf49dde 100644
 --- a/src/CMakeLists.txt
 +++ b/src/CMakeLists.txt
 @@ -1,6 +1,7 @@
@@ -494,20 +494,22 @@ index 8dd28c9..6234323 100644
  
  option(ENABLE_RENDERDOC "Build with renderdoc api" OFF)
  
-@@ -46,6 +47,7 @@ add_library(
+@@ -45,7 +46,9 @@ add_library(
+   WPShaderParser.cpp
    WPSceneParser.cpp
    WPShaderValueUpdater.cpp
++  WPJsScriptEngine.cpp
    WPTexImageParser.cpp
 +  VideoTex.cpp
    WPSoundParser.cpp
    WPMdlParser.cpp
    WPPuppet.cpp
-@@ -65,8 +67,8 @@ set(InteralLib
+@@ -65,8 +68,8 @@ set(InteralLib
  target_link_libraries(
    ${PROJECT_NAME}
    PUBLIC wpUtils
 -  PRIVATE ${InteralLib} nlohmann_json ${LZ4_LIBRARIES}
-+  PRIVATE ${InteralLib} nlohmann_json ${LZ4_LIBRARIES} ${FFMPEG_LIBRARIES}
++  PRIVATE ${InteralLib} nlohmann_json qjs ${LZ4_LIBRARIES} ${FFMPEG_LIBRARIES}
            ${CMAKE_THREAD_LIBS_INIT} ${CMAKE_DL_LIBS})
  
 -target_include_directories(${PROJECT_NAME} PUBLIC . Swapchain)
@@ -527,6 +529,32 @@ index ccefef4..677d980 100644
  };
  
  } // namespace wallpaper
+diff --git a/src/Scene/include/Scene/SceneMaterial.h b/src/Scene/include/Scene/SceneMaterial.h
+index 9663388..e3020bc 100644
+--- a/src/Scene/include/Scene/SceneMaterial.h
++++ b/src/Scene/include/Scene/SceneMaterial.h
+@@ -3,6 +3,7 @@
+ #include <vector>
+ #include <memory>
+ #include <unordered_set>
++#include <unordered_map>
+ 
+ #include "SceneShader.h"
+ #include "Type.hpp"
+@@ -13,6 +14,13 @@ namespace wallpaper
+ struct SceneMaterialCustomShader {
+     std::shared_ptr<SceneShader> shader;
+     ShaderValues                 constValues;
++    // GLSL uniform name -> SceneScript source, for constValues entries whose
++    // WP-Engine-authored JSON carried a "script" alongside its static
++    // fallback "value" (see WPMaterial.cpp). Run every frame by
++    // WPShaderValueUpdater via WPJsScriptEngine; constValues holds each
++    // entry's last-known value in the meantime (the static fallback until
++    // the script first runs, then whatever it last returned).
++    std::unordered_map<std::string, std::string> constValueScripts;
+ };
+ 
+ struct SceneMaterial {
 diff --git a/src/SpecTexs.hpp b/src/SpecTexs.hpp
 index 3edbd82..212711c 100644
 --- a/src/SpecTexs.hpp
@@ -1000,7 +1028,7 @@ index 9fb7776..8ccfcdc 100644
  
  #if ENABLE_RENDERDOC_API
 diff --git a/src/WPSceneParser.cpp b/src/WPSceneParser.cpp
-index 487c9f9..f6833dc 100644
+index 487c9f9..6d18bb7 100644
 --- a/src/WPSceneParser.cpp
 +++ b/src/WPSceneParser.cpp
 @@ -217,6 +217,13 @@ BlendMode ParseBlendMode(std::string_view str) {
@@ -1067,7 +1095,18 @@ index 487c9f9..f6833dc 100644
              } else {
                  svData.renderTargets.push_back({ i, name });
                  const auto& rt = pScene->renderTargets.at(name);
-@@ -522,7 +559,8 @@ void InitContext(ParseContext& context, fs::VFS& vfs, wpscene::WPScene& sc) {
+@@ -457,6 +494,10 @@ void LoadConstvalue(SceneMaterial& material, const wpscene::WPMaterial& wpmat,
+             LOG_ERROR("ShaderValue: %s not found in glsl", name.c_str());
+         } else {
+             material.customShader.constValues[glname] = value;
++            auto scriptIt = wpmat.constantshadervalueScripts.find(name);
++            if (scriptIt != wpmat.constantshadervalueScripts.end()) {
++                material.customShader.constValueScripts[glname] = scriptIt->second;
++            }
+         }
+     }
+ }
+@@ -522,7 +563,8 @@ void InitContext(ParseContext& context, fs::VFS& vfs, wpscene::WPScene& sc) {
          gb["g_TexelSize"]     = std::array { 1.0f / 1920.0f, 1.0f / 1080.0f };
          gb["g_TexelSizeHalf"] = std::array { 1.0f / 1920.0f / 2.0f, 1.0f / 1080.0f / 2.0f };
  
@@ -1096,7 +1135,7 @@ index 7c3eaec..ba4a4f4 100644
           it != std::sregex_iterator();
           it++) {
 diff --git a/src/WPShaderValueUpdater.cpp b/src/WPShaderValueUpdater.cpp
-index 4a1025e..e30602a 100644
+index 4a1025e..e5231f4 100644
 --- a/src/WPShaderValueUpdater.cpp
 +++ b/src/WPShaderValueUpdater.cpp
 @@ -6,6 +6,7 @@
@@ -1107,19 +1146,29 @@ index 4a1025e..e30602a 100644
  
  #include <Eigen/Dense>
  #include <Eigen/Geometry>
-@@ -17,6 +18,11 @@
+@@ -17,6 +18,12 @@
  using namespace wallpaper;
  using namespace Eigen;
  
 +// Defined here (not inline) because m_audio_ref holds a forward-declared type,
 +// whose deleter must see the complete type.
-+WPShaderValueUpdater::WPShaderValueUpdater(Scene* scene): m_scene(scene) {}
++WPShaderValueUpdater::WPShaderValueUpdater(Scene* scene)
++    : m_scene(scene), m_jsEngine(std::make_unique<WPJsScriptEngine>()) {}
 +WPShaderValueUpdater::~WPShaderValueUpdater() = default;
 +
  void WPShaderValueUpdater::FrameBegin() {
      /*
          using namespace std::chrono;
-@@ -72,6 +78,13 @@ void WPShaderValueUpdater::InitUniforms(SceneNode* pNode, const ExistsUniformOp&
+@@ -26,6 +33,8 @@ void WPShaderValueUpdater::FrameBegin() {
+             (((cTime->tm_hour * 60) + cTime->tm_min) * 60 + cTime->tm_sec) / (24.0f * 60.0f
+        * 60.0f);
+     */
++    m_jsEngine->BeginFrame((float)m_scene->frameTime, (float)m_scene->elapsingTime);
++
+     double new_time    = m_mouseDelayedTime + m_scene->frameTime;
+     new_time           = new_time > m_parallax.delay ? m_parallax.delay : new_time;
+     m_mouseDelayedTime = new_time;
+@@ -72,6 +81,13 @@ void WPShaderValueUpdater::InitUniforms(SceneNode* pNode, const ExistsUniformOp&
      info.has_TEXELSIZEHALF    = existsOp(G_TEXELSIZEHALF);
      info.has_SCREEN           = existsOp(G_SCREEN);
      info.has_LP               = existsOp(G_LP);
@@ -1133,7 +1182,7 @@ index 4a1025e..e30602a 100644
  
      std::accumulate(begin(info.texs), end(info.texs), 0, [&existsOp](uint index, auto& value) {
          value.has_resolution = existsOp(WE_GLTEX_RESOLUTION_NAMES[index]);
-@@ -235,6 +248,33 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
+@@ -235,6 +251,48 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
          updateOp(G_LP, lights);
          updateOp(G_LCP, lights_color);
      }
@@ -1160,6 +1209,21 @@ index 4a1025e..e30602a 100644
 +        if (info.has_AS16L) updateOp(G_AS16L, std::span<const float> { left.data(), left.size() });
 +        if (info.has_AS16R) updateOp(G_AS16R, std::span<const float> { right.data(), right.size() });
 +    }
++
++    // SceneScript-driven constant shader values (see SceneMaterial.h,
++    // WPMaterial.cpp). Keyed per (node, glsl uniform name) rather than just
++    // the uniform name, so two layers that happen to use the identical
++    // script text each still get their own independent module-scope state
++    // (e.g. two separately-timed fade-ins must not share one elapsedTime).
++    for (auto& [glname, script] : material->customShader.constValueScripts) {
++        auto& value = material->customShader.constValues[glname];
++        std::vector<float> v(value.data(), value.data() + value.size());
++        std::string key = std::to_string(reinterpret_cast<uintptr_t>(pNode)) + ":" + glname;
++        if (m_jsEngine->RunUpdate(key, script, v)) {
++            value = ShaderValue(v);
++        }
++        updateOp(glname, value);
++    }
 +}
 +
 +void WPShaderValueUpdater::RequestAudio() {
@@ -1168,10 +1232,16 @@ index 4a1025e..e30602a 100644
  
  void WPShaderValueUpdater::SetNodeData(void* nodeAddr, const WPShaderValueData& data) {
 diff --git a/src/WPShaderValueUpdater.hpp b/src/WPShaderValueUpdater.hpp
-index 3d5729c..d2275af 100644
+index 3d5729c..621d785 100644
 --- a/src/WPShaderValueUpdater.hpp
 +++ b/src/WPShaderValueUpdater.hpp
-@@ -18,6 +18,7 @@ namespace wallpaper
+@@ -13,11 +13,13 @@
+ #include "Core/MapSet.hpp"
+ #include "SpriteAnimation.hpp"
+ #include "WPPuppet.hpp"
++#include "WPJsScriptEngine.hpp"
+ 
+ namespace wallpaper
  {
  
  class Scene;
@@ -1179,7 +1249,7 @@ index 3d5729c..d2275af 100644
  
  struct WPUniformInfo {
      bool has_MI { false };
-@@ -38,6 +39,9 @@ struct WPUniformInfo {
+@@ -38,6 +40,9 @@ struct WPUniformInfo {
      bool has_TEXELSIZEHALF { false };
      bool has_SCREEN { false };
      bool has_LP { false };
@@ -1189,7 +1259,7 @@ index 3d5729c..d2275af 100644
  
      struct Tex {
          bool has_resolution { false };
-@@ -63,8 +67,8 @@ struct WPCameraParallax {
+@@ -63,8 +68,8 @@ struct WPCameraParallax {
  
  class WPShaderValueUpdater : public IShaderValueUpdater {
  public:
@@ -1200,7 +1270,7 @@ index 3d5729c..d2275af 100644
  
      void FrameBegin() override;
  
-@@ -80,7 +84,13 @@ public:
+@@ -80,7 +85,20 @@ public:
      void SetScreenSize(i32 w, i32 h) override { m_screen_size = { (float)w, (float)h }; }
  
  private:
@@ -1211,6 +1281,13 @@ index 3d5729c..d2275af 100644
 +
      Scene*               m_scene;
 +    std::unique_ptr<AudioCaptureRef> m_audio_ref;
++    // Runs any constValueScripts entries (see SceneMaterial.h) once per
++    // frame from UpdateUniforms(); always constructed (not lazy like
++    // m_audio_ref) since even an unused QuickJS runtime is cheap and a
++    // per-material null check at every UpdateUniforms() call is not worth
++    // the ~1 avoided allocation for the (common) case of a scene with no
++    // scripted values at all.
++    std::unique_ptr<WPJsScriptEngine> m_jsEngine;
      WPCameraParallax     m_parallax;
      double               m_dayTime { 0.0f };
      std::array<float, 2> m_texelSize { 1.0f / 1920.0f, 1.0f / 1080.0f };
@@ -1282,3 +1359,97 @@ index ec396e4..5088150 100644
                  int32_t w, h, n;
                  auto*   data =
                      stbi_load_from_memory((const unsigned char*)result, src_size, &w, &h, &n, 4);
+diff --git a/src/wpscene/WPMaterial.cpp b/src/wpscene/WPMaterial.cpp
+index 5fd9367..5b9afa3 100644
+--- a/src/wpscene/WPMaterial.cpp
++++ b/src/wpscene/WPMaterial.cpp
+@@ -22,6 +22,9 @@ void WPMaterialPass::Update(const WPMaterialPass& p) {
+     for(const auto& el:p.constantshadervalues) {
+         constantshadervalues[el.first] = el.second;
+     }
++    for(const auto& el:p.constantshadervalueScripts) {
++        constantshadervalueScripts[el.first] = el.second;
++    }
+     for(const auto& el:p.combos) {
+         combos[el.first] = el.second;
+     }
+@@ -40,6 +43,9 @@ void WPMaterial::MergePass(const WPMaterialPass& p) {
+     for(const auto& el:p.constantshadervalues) {
+         constantshadervalues[el.first] = el.second;
+     }
++    for(const auto& el:p.constantshadervalueScripts) {
++        constantshadervalueScripts[el.first] = el.second;
++    }
+     for(const auto& el:p.combos) {
+         combos[el.first] = el.second;
+     }
+@@ -61,6 +67,17 @@ bool WPMaterialPass::FromJson(const nlohmann::json& json) {
+             GET_JSON_VALUE(jC.key(), name);
+             GET_JSON_VALUE(jC.value(), value);
+             constantshadervalues[name] = value;
++            // A SceneScript-driven value looks like {"value": [...], "script":
++            // "..."} - the fallback above already reads "value"; separately
++            // capture "script" (previously silently dropped, so any wallpaper
++            // relying on it - an animated fade, a delayed reveal - just froze
++            // at the static value forever) so WPShaderValueUpdater can run it
++            // every frame instead.
++            if(jC.value().is_object() && jC.value().contains("script")) {
++                std::string script;
++                GET_JSON_VALUE(jC.value().at("script"), script);
++                constantshadervalueScripts[name] = script;
++            }
+         }
+     }
+     if(json.contains("combos")) {
+@@ -113,6 +130,11 @@ bool WPMaterial::FromJson(const nlohmann::json& json) {
+             GET_JSON_VALUE(jC.key(), name);
+             GET_JSON_VALUE(jC.value(), value);
+             constantshadervalues[name] = value;
++            if(jC.value().is_object() && jC.value().contains("script")) {
++                std::string script;
++                GET_JSON_VALUE(jC.value().at("script"), script);
++                constantshadervalueScripts[name] = script;
++            }
+         }
+     }
+     if(jContent.contains("combos")) {
+diff --git a/src/wpscene/WPMaterial.h b/src/wpscene/WPMaterial.h
+index de8354f..c078109 100644
+--- a/src/wpscene/WPMaterial.h
++++ b/src/wpscene/WPMaterial.h
+@@ -24,6 +24,12 @@ public:
+     std::vector<std::string>                            textures;
+     std::unordered_map<std::string, int32_t>            combos;
+     std::unordered_map<std::string, std::vector<float>> constantshadervalues;
++    // A constantshadervalue entry can carry a SceneScript "script" alongside
++    // its static "value" fallback (e.g. {"value": [1], "script": "..."}) -
++    // WPShaderValueUpdater runs it every frame via WPJsScriptEngine instead
++    // of using the static value verbatim. Keyed the same as
++    // constantshadervalues; only present for entries that actually have one.
++    std::unordered_map<std::string, std::string>        constantshadervalueScripts;
+     std::string                                         target;
+     std::vector<WPMaterialPassBindItem>                 bind;
+ };
+@@ -40,6 +46,7 @@ public:
+     std::vector<std::string>                            textures;
+     std::unordered_map<std::string, int32_t>            combos;
+     std::unordered_map<std::string, std::vector<float>> constantshadervalues;
++    std::unordered_map<std::string, std::string>        constantshadervalueScripts;
+ 
+     bool use_puppet { false };
+ };
+diff --git a/third_party/CMakeLists.txt b/third_party/CMakeLists.txt
+index 190e213..5fbb8ea 100644
+--- a/third_party/CMakeLists.txt
++++ b/third_party/CMakeLists.txt
+@@ -21,3 +21,10 @@ set(ENABLE_GLSLANG_JS OFF)
+ set(ENABLE_HLSL OFF)
+ set(ENABLE_OPT OFF)
+ add_subdirectory(glslang EXCLUDE_FROM_ALL)
++
++# quickjs-ng (MIT) - JS engine for Wallpaper Engine's SceneScript
++# (constantshadervalue.script) feature. Static "qjs" lib target only;
++# EXCLUDE_FROM_ALL keeps its CLI/test executables out of the default build.
++set(QJS_ENABLE_INSTALL OFF)
++set(QJS_BUILD_EXAMPLES OFF)
++add_subdirectory(quickjs EXCLUDE_FROM_ALL)

@@ -357,3 +357,103 @@ desktop down while iterating - took real setup, worth recording:
   on a float) - fix 9 stops it from corrupting the screen, but the bar-graph
   visualizer itself is still absent, same "renders fine without it" category
   as the other entries here.
+
+## 10. SceneScript (`constantshadervalue.script`) never executed - added a real JS engine
+
+Wallpaper Engine authors can attach a small JS snippet to a shader value
+instead of a static constant - an ES6 module exporting `update(value)`,
+called every frame, with an `engine.frametime`/`engine.runtime` global for
+frame-rate-independent timing. This is how e.g. 3605722997's entrance
+animation is *supposed* to fade out once (18s play, 0.5s fade) and disappear
+- and it's genuinely common: any delayed reveal, pulsing glow, or
+non-trivial animated value on a wallpaper Workshop item likely uses this.
+
+**This renderer never implemented it at all.** Confirmed by an exhaustive
+grep of the whole tree for any JS engine (mujs/quickjs/duktape/etc.) -
+zero hits. The JSON parser only ever read the static `"value"` fallback
+next to `"script"` and silently ignored the script text entirely
+(`WPJson.cpp`'s `GetJsonValue`), so anything relying on a script just froze
+forever at that static value - for 3605722997 specifically, frozen at
+opacity 1, combined with this renderer's video/sprite playback having no
+"play once" mode anywhere (`VideoTex.cpp` rewinds on EOF unconditionally,
+`SpriteAnimation.hpp` wraps to frame 0 unconditionally) - the intro clip
+just played on loop forever instead of fading out after one play.
+
+**Added a real one: [quickjs-ng](https://github.com/quickjs-ng/quickjs)**
+(MIT), vendored at `third_party/quickjs` (not part of `renderer-fixes.patch`
+- see "Vendoring quickjs-ng" below). A different, GPL-3.0-licensed
+open-source Wallpaper Engine Linux port
+([Almamu/linux-wallpaperengine](https://github.com/Almamu/linux-wallpaperengine))
+already solves exactly this with the same engine - useful as an
+architecture reference (one JSRuntime/JSContext per scene; a script is
+compiled once as an ES6 module and its resulting module-namespace `JSValue`
+is cached and reused for every later frame, which is what makes
+module-scope state like `let elapsedTime = 0` actually persist between
+calls instead of resetting every frame; `engine` is a plain object with C
+getter-property bindings) - but GPL-3.0 code cannot be pulled into this
+GPL-2.0 project (one-directional incompatibility, confirmed by reading both
+projects' actual LICENSE files, not just assumed from the file's boilerplate
+header), so nothing was copied from it; `WPJsScriptEngine.{hpp,cpp}` here is
+an independent implementation written directly against QuickJS's own C API.
+
+New files: `src/WPJsScriptEngine.{hpp,cpp}` (the engine itself, pimpl'd -
+`quickjs.h` is never included outside this one `.cpp`). Threaded through the
+existing constant-shader-value pipeline: `wpscene/WPMaterial.{h,cpp}` now
+also captures a `constantshadervalueScripts` map alongside the existing
+static-value map when a `"script"` key is present; `WPSceneParser.cpp`'s
+`LoadConstvalue` carries it through into a new
+`SceneMaterialCustomShader::constValueScripts` map
+(`Scene/include/Scene/SceneMaterial.h`), keyed by the same resolved GLSL
+uniform name as the existing `constValues`; `WPShaderValueUpdater.cpp`'s
+per-frame `UpdateUniforms()` (already the home of every other
+frame-varying uniform - camera matrices, mouse position, audio spectrum)
+runs each one through `WPJsScriptEngine::RunUpdate()` and writes the result
+into the same uniform slot the static path already writes to, keyed per
+`(SceneNode*, glname)` pair so two layers that happen to share identical
+script text still each get their own independent module-scope state.
+
+**One real bug found and fixed via the isolated test harness (see fix 9's
+tooling section) before ever touching the live desktop:** a completely
+ordinary ~30-line script failed to even *compile*, throwing "Maximum call
+stack size exceeded" - not a script problem. QuickJS's recursion-depth guard
+(`js_check_stack_overflow`) compares the current C stack pointer against a
+"top of stack" reference that, by default, is captured once, at
+`JS_NewRuntime()` time. `WPJsScriptEngine` is constructed during scene
+setup, but `RunUpdate()` is only ever called much later, from deep inside a
+per-node call in `UpdateUniforms()` - itself reached through however many
+frames of scene-graph traversal and per-frame update dispatch happened to
+stack up by then. That ordinary C++ call depth alone was enough to eat
+QuickJS's entire default 1MB budget (`JS_DEFAULT_STACK_SIZE`) before
+QuickJS's own parser did anything deep at all. Fix: call
+`JS_UpdateStackTop(rt)` at the top of `RunUpdate()` itself - immediately
+before the only two calls in this file that can recurse into QuickJS's C
+stack usage (`JS_Eval`/`JS_Call`) - so the reference reflects the actual
+call site instead of wherever `JS_NewRuntime()` happened to run. Calling it
+once per *frame* instead (tried first) was not suffient: `BeginFrame()`
+runs once per frame near the top of the update sequence, at meaningfully
+*less* call depth than deep inside per-node scene traversal - the reference
+still went stale by the time execution actually reached `JS_Eval`.
+
+Verified live end-to-end on 3605722997: no `VK_ERROR_*`, no coredump, no
+regression on an unrelated wallpaper checked in the same harness run - and
+functionally, the entrance animation now plays once and fades out exactly
+as designed (confirmed at both the ~10s and ~40s marks post-restart: fully
+faded, artwork underneath fully revealed, no loop-back).
+
+### Vendoring quickjs-ng
+
+Not part of `renderer-fixes.patch` (127K+ lines of vendored source would
+swamp a patch meant to stay reviewable) - a separate step:
+
+```sh
+curl -sL "https://api.github.com/repos/quickjs-ng/quickjs/tarball/v0.16.1" \
+    -o quickjs.tar.gz -H "Accept: application/vnd.github+json"
+mkdir -p we-build/src/backend_scene/third_party/quickjs
+tar xzf quickjs.tar.gz -C we-build/src/backend_scene/third_party/quickjs --strip-components=1
+```
+
+Then apply `renderer-fixes.patch` as usual, which wires it into
+`third_party/CMakeLists.txt` (`add_subdirectory(quickjs EXCLUDE_FROM_ALL)` -
+static `qjs` lib target only, its CLI/test executables excluded from the
+default build) and links it into `src/CMakeLists.txt`'s
+`WallpaperEngineKde`/`wescene-renderer` target.
