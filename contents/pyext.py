@@ -272,10 +272,16 @@ class Main:
             else:
                 caps["sound"] = self.__dir_has_audio(folder)
         elif wtype == "web":
-            # Web wallpapers play their own audio through the page, which this
-            # plugin's web backend does not route through the volume control at
-            # all, so there is nothing here for those settings to act on.
-            caps["sound"] = False
+            # Web wallpapers play their own audio through the page. Mute
+            # genuinely works (QtWebView.qml binds WebEngineView.audioMuted
+            # to it), but there is no per-wallpaper Volume control wired for
+            # the web backend at all - a finer distinction than "sound: bool"
+            # can express, so leave sound at its honest default (True/
+            # unknown) rather than hiding a control (Mute) that actually
+            # works. Previously hard-set to False here, which incorrectly
+            # hid Mute Audio for every web wallpaper once the per-wallpaper
+            # Option panel started using this same capability check.
+            pass
 
         return caps
 

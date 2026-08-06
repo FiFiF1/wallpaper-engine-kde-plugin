@@ -950,8 +950,16 @@ RowLayout {
                             return config[key];
                         return null;
                     }
-                    function has_change(key) {
-                        return config.hasOwnProperty(key) || in_config_changes(key);
+                    // "Has a saved/pending override" alone isn't enough for the
+                    // pencil-icon/reset-button indicator: dragging a slider back to
+                    // its own default leaves the override present on disk (still
+                    // exactly that default value) but the row is no longer
+                    // meaningfully "changed", so the indicator should clear. def_val
+                    // is optional so callers that don't have one handle exactly like
+                    // before (existence-only check).
+                    function has_change(key, def_val) {
+                        if (!config.hasOwnProperty(key) && !in_config_changes(key)) return false;
+                        return def_val === undefined || get_config_val(key) !== def_val;
                     }
 
                     header.text: 'Option'
@@ -1059,9 +1067,13 @@ RowLayout {
                                 text: 'Mouse Input',
                                 config_key: 'mouse_input',
                                 // Hooking the mouse goes through the native
-                                // scene library, so this does nothing for a
-                                // video or a web page (matches SettingPage.qml).
-                                visible: libcheck.wallpaper && right_content.isScene,
+                                // library for both scene and web (QtWebView.qml's
+                                // getMouseTarget() is a real implementation, not a
+                                // stub - confirmed live: hookMouse() successfully
+                                // resolves a genuine QtWebEngineCore render target
+                                // for a web wallpaper). Video backends have no
+                                // authored mouse-reactive behaviour to hook into.
+                                visible: libcheck.wallpaper && (right_content.isScene || right_content.isWeb),
                                 comp: right_opt_switch,
                                 props: {
                                     def_val: cfg_MouseInput,
@@ -1156,7 +1168,7 @@ RowLayout {
 
                             property bool is_changed: right_opts.config && 
                                 right_opts.config_changes && 
-                                right_opts.has_change(modelData.config_key)
+                                right_opts.has_change(modelData.config_key, modelData.props.def_val)
 
                             icon: is_changed ? Qt.resolvedUrl('../../images/edit-pencil.svg') : ''
                             resetVisible: is_changed

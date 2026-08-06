@@ -341,10 +341,12 @@ Flickable {
                 }
             }
  
-            // Hooking the mouse goes through the native scene library, so this
-            // does nothing for a video or a web page.
+            // Hooking the mouse goes through the native library for both scene
+            // and web (QtWebView.qml's getMouseTarget() is a real implementation,
+            // not a stub) - a video backend has no authored mouse-reactive
+            // behaviour to hook into.
             OptionItem {
-                visible: libcheck.wallpaper && settingTab.isScene
+                visible: libcheck.wallpaper && (settingTab.isScene || settingTab.isWeb)
                 text_color: Kirigami.Theme.textColor
                 text: "Mouse Input"
                 icon: '../../images/mouse.svg'
